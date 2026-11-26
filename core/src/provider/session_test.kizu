@@ -1,0 +1,677 @@
+import std::array;
+import std::machine;
+import std::mem;
+import std::string;
+import std::testing;
+
+fn session_machine_next(state: ProviderSessionState, ev: ProviderSessionEvent) -> ProviderSessionState {
+    return provider_session_advance(state, ev).state;
+}
+
+fn session_machine_outcome(state: ProviderSessionState, ev: ProviderSessionEvent) -> ProviderSessionOutcome {
+    return provider_session_advance(state, ev).outcome;
+}
+
+fn session_machine_never_ends(state: ProviderSessionState) -> bool {
+    let _ = state;
+    return false;
+}
+
+fn poll_until(
+    allocator: Allocator,
+    session: &var ProviderSession,
+    events: &var array::Array<SessionEvent>,
+    target: SessionEventKind
+) -> mem::Error!bool {
+    for 0..120 |_| {
+        let _ = try session.poll(allocator, events);
+        var idx: i64 = 0;
+        while events.at(idx) |ev| {
+            if ev.kind == target {
+                return true;
+            }
+            idx = idx + 1;
+        }
+        let _ = unsafe usleep(5000);
+    }
+    return false;
+}
+
+test "every state of provider_session_advance is reachable with no table problems" {
+    let allocator = mem::page_allocator();
+    let table = try machine::answers<
+        ProviderSessionState,
+        ProviderSessionEvent,
+        ProviderSessionOutcome
+    >(
+        allocator,
+        session_machine_next,
+        session_machine_outcome,
+        ProviderSessionState::Disconnected,
+        session_machine_never_ends
+    );
+    defer table.deinit(allocator);
+    var problems = try table.problems(allocator);
+    defer problems.deinit(allocator);
+    if problems.at(0) |line| {
+        let bytes = line.as_bytes();
+        testing::fail(bytes);
+    }
+}
+
+test "ACP live session completes handshake, syncs models, handles permission, and streams turn" {
+    let allocator = mem::page_allocator();
+    let script =
+        \\import json, os, sys
+        \\assert os.environ.get("OPENCODE_DISABLE_TELEMETRY") == "1"
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}}), flush=True)
+        \\    elif method == "session/new":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":"ses-acp-1","configOptions":[{"id":"model","category":"model","currentValue":"mock/m1","options":[{"value":"mock/m1","name":"M1"},{"value":"mock/m2","name":"M2"}]}]}}), flush=True)
+        \\    elif method == "session/prompt":
+        \\        pid = msg["id"]
+        \\        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses-acp-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","kind":"shell","title":"ls -la","status":"in_progress"}}}), flush=True)
+        \\        print(json.dumps({"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"toolCall":{"kind":"shell","title":"ls -la"},"options":[{"optionId":"opt-allow","kind":"allow_once"},{"optionId":"opt-deny","kind":"reject_once"}]}}), flush=True)
+        \\        perm_raw = sys.stdin.readline()
+        \\        perm = json.loads(perm_raw)
+        \\        assert perm["result"]["outcome"]["optionId"] == "opt-allow"
+        \\        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses-acp-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","title":"ls -la","status":"completed"}}}), flush=True)
+        \\        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses-acp-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ACP reply ok"}}}}), flush=True)
+        \\        print(json.dumps({"jsonrpc":"2.0","id":pid,"result":{"stopReason":"end_turn"}}), flush=True)
+    ;
+    var ov_args = string::new(allocator);
+    defer ov_args.deinit(allocator);
+    try ov_args.append_bytes(allocator, "-u");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, "-c");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, script);
+
+    var overrides = array::new<CommandOverride>(allocator);
+    defer overrides.deinit(allocator);
+    let ov_bytes = ov_args.as_bytes();
+    try overrides.append(
+        allocator,
+        try new_command_override(allocator, ProviderKind::OpenCodeAcp, "/usr/bin/python3", ov_bytes)
+    );
+
+    var session = new_provider_session(allocator, 1, ProviderKind::OpenCodeAcp);
+    defer session.deinit(allocator);
+
+    var attachments = array::new<string::String>(allocator);
+    defer attachments.deinit(allocator);
+    var events = array::new<SessionEvent>(allocator);
+    defer events.deinit(allocator);
+
+    testing::expect(try session.start_turn(
+        allocator,
+        ProviderKind::OpenCodeAcp,
+        "/tmp",
+        "default",
+        ReasoningEffort::Medium,
+        "",
+        true,
+        "/tmp/kasugai-test.sock",
+        "/tmp/kasugai-bin",
+        &overrides,
+        "hello acp",
+        &attachments,
+        &var events
+    ));
+    testing::expect(try poll_until(allocator, &var session, &var events, SessionEventKind::PermissionRequested));
+    testing::expect(session.state == ProviderSessionState::AwaitingPermission);
+    testing::expect(try session.resolve_permission(allocator, true));
+    testing::expect(try poll_until(allocator, &var session, &var events, SessionEventKind::TurnCompleted));
+    testing::expect(session.state == ProviderSessionState::Ready);
+
+    var saw_models = false;
+    var saw_delta = false;
+    var saw_activity = false;
+    var idx: i64 = 0;
+    while events.at(idx) |ev| {
+        if ev.kind == SessionEventKind::ModelsUpdated and ev.models.len() == 2 {
+            saw_models = true;
+        }
+        if ev.kind == SessionEventKind::Activity {
+            saw_activity = true;
+        }
+        if ev.kind == SessionEventKind::Delta {
+            let txt = ev.text.as_bytes();
+            if mem::equal_bytes(txt, "ACP reply ok") {
+                saw_delta = true;
+            }
+        }
+        idx = idx + 1;
+    }
+    testing::expect(saw_models);
+    testing::expect(saw_delta);
+    testing::expect(saw_activity);
+}
+
+test "Claude stream-json and Codex app-server live sessions handle streaming and approvals" {
+    let allocator = mem::page_allocator();
+    let claude_script =
+        \\import json, os, sys
+        \\assert os.environ.get("DISABLE_TELEMETRY") == "1"
+        \\assert os.environ.get("KASUGAI_CTL_SOCKET") == "/tmp/kasugai-ctl.sock"
+        \\for line in sys.stdin:
+        \\    msg = json.loads(line)
+        \\    assert msg["type"] == "user"
+        \\    print(json.dumps({"type":"system","session_id":"claude-ses-42"}), flush=True)
+        \\    print(json.dumps({"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-1","name":"Bash","input":{"command":"pwd"}}]}}), flush=True)
+        \\    print(json.dumps({"type":"control_request","request_id":"req-c1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"pwd"}}}), flush=True)
+        \\    resp = json.loads(sys.stdin.readline())
+        \\    assert resp["response"]["response"]["behavior"] == "allow"
+        \\    print(json.dumps({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu-1","is_error":False,"content":"/tmp"}]}}), flush=True)
+        \\    print(json.dumps({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Claude ok"}}}), flush=True)
+        \\    print(json.dumps({"type":"result","is_error":False,"result":"Claude ok"}), flush=True)
+    ;
+    var c_args = string::new(allocator);
+    defer c_args.deinit(allocator);
+    try c_args.append_bytes(allocator, "-u");
+    try c_args.append_byte(allocator, 31);
+    try c_args.append_bytes(allocator, "-c");
+    try c_args.append_byte(allocator, 31);
+    try c_args.append_bytes(allocator, claude_script);
+
+    let codex_script =
+        \\import json, os, sys
+        \\assert os.environ.get("CODEX_DISABLE_TELEMETRY") == "1"
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"id":msg["id"],"result":{"userAgent":"codex-mock"}}), flush=True)
+        \\    elif method == "model/list":
+        \\        print(json.dumps({"id":msg["id"],"result":{"data":[{"id":"gpt-5-codex","model":"gpt-5-codex"}]}}), flush=True)
+        \\    elif method == "thread/start":
+        \\        print(json.dumps({"id":msg["id"],"result":{"thread":{"id":"codex-th-7"}}}), flush=True)
+        \\    elif method == "turn/start":
+        \\        inputs = msg["params"]["input"]
+        \\        assert any(i.get("type") == "localImage" for i in inputs)
+        \\        print(json.dumps({"id":msg["id"],"result":{"turn":{"id":"t1"}}}), flush=True)
+        \\        print(json.dumps({"method":"item/started","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"git diff"}}}), flush=True)
+        \\        print(json.dumps({"id":50,"method":"item/commandExecution/requestApproval","params":{"command":"git diff"}}), flush=True)
+        \\        reply = json.loads(sys.stdin.readline())
+        \\        assert reply["result"]["decision"] == "accept"
+        \\        print(json.dumps({"method":"item/completed","params":{"item":{"id":"cmd-1","type":"commandExecution","command":"git diff","status":"completed"}}}), flush=True)
+        \\        print(json.dumps({"method":"item/agentMessage/delta","params":{"delta":"Codex ok"}}), flush=True)
+        \\        print(json.dumps({"method":"turn/completed","params":{"turn":{"status":"completed"}}}), flush=True)
+    ;
+    var x_args = string::new(allocator);
+    defer x_args.deinit(allocator);
+    try x_args.append_bytes(allocator, "-u");
+    try x_args.append_byte(allocator, 31);
+    try x_args.append_bytes(allocator, "-c");
+    try x_args.append_byte(allocator, 31);
+    try x_args.append_bytes(allocator, codex_script);
+
+    var overrides = array::new<CommandOverride>(allocator);
+    defer overrides.deinit(allocator);
+    let c_bytes = c_args.as_bytes();
+    let x_bytes = x_args.as_bytes();
+    try overrides.append(
+        allocator,
+        try new_command_override(allocator, ProviderKind::ClaudeCode, "/usr/bin/python3", c_bytes)
+    );
+    try overrides.append(
+        allocator,
+        try new_command_override(allocator, ProviderKind::Codex, "/usr/bin/python3", x_bytes)
+    );
+
+    var claude_session = new_provider_session(allocator, 2, ProviderKind::ClaudeCode);
+    defer claude_session.deinit(allocator);
+    var empty_att = array::new<string::String>(allocator);
+    defer empty_att.deinit(allocator);
+    var c_events = array::new<SessionEvent>(allocator);
+    defer c_events.deinit(allocator);
+
+    testing::expect(try claude_session.start_turn(
+        allocator,
+        ProviderKind::ClaudeCode,
+        "/tmp",
+        "default",
+        ReasoningEffort::High,
+        "",
+        true,
+        "/tmp/kasugai-ctl.sock",
+        "/tmp/kasugai-bin",
+        &overrides,
+        "hello claude",
+        &empty_att,
+        &var c_events
+    ));
+    testing::expect(try poll_until(allocator, &var claude_session, &var c_events, SessionEventKind::PermissionRequested));
+    testing::expect(try claude_session.resolve_permission(allocator, true));
+    testing::expect(try poll_until(allocator, &var claude_session, &var c_events, SessionEventKind::TurnCompleted));
+    let claude_sid = claude_session.session_id.as_bytes();
+    testing::expect(mem::equal_bytes(claude_sid, "claude-ses-42"));
+    testing::expect(!claude_session.can_reuse_live(ProviderKind::ClaudeCode, "/tmp", "claude-opus-4-1", ReasoningEffort::High, true));
+    testing::expect(claude_session.can_reuse_live(ProviderKind::ClaudeCode, "/tmp", "default", ReasoningEffort::High, true));
+    var saw_claude_activity = false;
+    var c_idx: i64 = 0;
+    while c_events.at(c_idx) |ev| {
+        if ev.kind == SessionEventKind::Activity {
+            saw_claude_activity = true;
+        }
+        c_idx = c_idx + 1;
+    }
+    testing::expect(saw_claude_activity);
+
+    var codex_session = new_provider_session(allocator, 3, ProviderKind::Codex);
+    defer codex_session.deinit(allocator);
+    var img_att = array::new<string::String>(allocator);
+    defer img_att.deinit(allocator);
+    try img_att.append(allocator, try string::from_bytes(allocator, "/tmp/shot.png"));
+    var x_events = array::new<SessionEvent>(allocator);
+    defer x_events.deinit(allocator);
+
+    testing::expect(try codex_session.start_turn(
+        allocator,
+        ProviderKind::Codex,
+        "/tmp",
+        "gpt-5-codex",
+        ReasoningEffort::XHigh,
+        "",
+        true,
+        "",
+        "",
+        &overrides,
+        "hello codex",
+        &img_att,
+        &var x_events
+    ));
+    testing::expect(try poll_until(allocator, &var codex_session, &var x_events, SessionEventKind::PermissionRequested));
+    testing::expect(try codex_session.resolve_permission(allocator, true));
+    testing::expect(try poll_until(allocator, &var codex_session, &var x_events, SessionEventKind::TurnCompleted));
+    testing::expect(codex_session.state == ProviderSessionState::Ready);
+    var saw_codex_activity = false;
+    var x_idx: i64 = 0;
+    while x_events.at(x_idx) |ev| {
+        if ev.kind == SessionEventKind::Activity {
+            saw_codex_activity = true;
+        }
+        x_idx = x_idx + 1;
+    }
+    testing::expect(saw_codex_activity);
+}
+
+test "ACP session/load and Codex thread/resume restore context and fall back cleanly on error" {
+    let allocator = mem::page_allocator();
+    let acp_resume_script =
+        \\import json, sys
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}}), flush=True)
+        \\    elif method == "session/load":
+        \\        sid = msg["params"]["sessionId"]
+        \\        if sid == "ses-valid":
+        \\            print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"stale replay"}}}}), flush=True)
+        \\            print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"tool_call","toolCallId":"old-1","kind":"shell","title":"old","status":"completed"}}}), flush=True)
+        \\            print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{}}), flush=True)
+        \\        else:
+        \\            print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"error":{"code":-32002,"message":"session not found"}}), flush=True)
+        \\    elif method == "session/new":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":"ses-fresh"}}), flush=True)
+        \\    elif method == "session/prompt":
+        \\        sid = msg["params"]["sessionId"]
+        \\        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok:" + sid}}}}), flush=True)
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn"}}), flush=True)
+    ;
+    let codex_resume_script =
+        \\import json, sys
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"id":msg["id"],"result":{"userAgent":"codex-mock"}}), flush=True)
+        \\    elif method == "model/list":
+        \\        print(json.dumps({"id":msg["id"],"result":{"data":[]}}), flush=True)
+        \\    elif method == "thread/resume":
+        \\        tid = msg["params"]["threadId"]
+        \\        if tid == "codex-valid":
+        \\            print(json.dumps({"id":msg["id"],"result":{"thread":{"id":tid}}}), flush=True)
+        \\        else:
+        \\            print(json.dumps({"id":msg["id"],"error":{"code":-32002,"message":"thread missing"}}), flush=True)
+        \\    elif method == "thread/start":
+        \\        print(json.dumps({"id":msg["id"],"result":{"thread":{"id":"codex-fresh"}}}), flush=True)
+        \\    elif method == "turn/start":
+        \\        tid = msg["params"]["threadId"]
+        \\        print(json.dumps({"id":msg["id"],"result":{"turn":{"id":"t1"}}}), flush=True)
+        \\        print(json.dumps({"method":"item/agentMessage/delta","params":{"delta":"ok:" + tid}}), flush=True)
+        \\        print(json.dumps({"method":"turn/completed","params":{"turn":{"status":"completed"}}}), flush=True)
+    ;
+
+    var acp_args = string::new(allocator);
+    defer acp_args.deinit(allocator);
+    try acp_args.append_bytes(allocator, "-u");
+    try acp_args.append_byte(allocator, 31);
+    try acp_args.append_bytes(allocator, "-c");
+    try acp_args.append_byte(allocator, 31);
+    try acp_args.append_bytes(allocator, acp_resume_script);
+
+    var codex_args = string::new(allocator);
+    defer codex_args.deinit(allocator);
+    try codex_args.append_bytes(allocator, "-u");
+    try codex_args.append_byte(allocator, 31);
+    try codex_args.append_bytes(allocator, "-c");
+    try codex_args.append_byte(allocator, 31);
+    try codex_args.append_bytes(allocator, codex_resume_script);
+
+    var overrides = array::new<CommandOverride>(allocator);
+    defer overrides.deinit(allocator);
+    let acp_arg_bytes = acp_args.as_bytes();
+    let codex_arg_bytes = codex_args.as_bytes();
+    try overrides.append(
+        allocator,
+        try new_command_override(allocator, ProviderKind::AntigravityAcp, "/usr/bin/python3", acp_arg_bytes)
+    );
+    try overrides.append(
+        allocator,
+        try new_command_override(allocator, ProviderKind::Codex, "/usr/bin/python3", codex_arg_bytes)
+    );
+
+    var empty_att = array::new<string::String>(allocator);
+    defer empty_att.deinit(allocator);
+
+    var acp_ok = new_provider_session(allocator, 10, ProviderKind::AntigravityAcp);
+    defer acp_ok.deinit(allocator);
+    var acp_ok_events = array::new<SessionEvent>(allocator);
+    defer acp_ok_events.deinit(allocator);
+    testing::expect(try acp_ok.start_turn(
+        allocator,
+        ProviderKind::AntigravityAcp,
+        "/tmp",
+        "default",
+        ReasoningEffort::Medium,
+        "ses-valid",
+        true,
+        "",
+        "",
+        &overrides,
+        "continue",
+        &empty_att,
+        &var acp_ok_events
+    ));
+    testing::expect(try poll_until(allocator, &var acp_ok, &var acp_ok_events, SessionEventKind::TurnCompleted));
+    let acp_ok_sid = acp_ok.session_id.as_bytes();
+    testing::expect(mem::equal_bytes(acp_ok_sid, "ses-valid"));
+    var saw_resumed_acp = false;
+    var saw_stale_replay = false;
+    var idx: i64 = 0;
+    while acp_ok_events.at(idx) |ev| {
+        if ev.kind == SessionEventKind::Delta {
+            let delta_bytes = ev.text.as_bytes();
+            if mem::equal_bytes(delta_bytes, "ok:ses-valid") {
+                saw_resumed_acp = true;
+            }
+            if mem::equal_bytes(delta_bytes, "stale replay") {
+                saw_stale_replay = true;
+            }
+        }
+        if ev.kind == SessionEventKind::Activity {
+            saw_stale_replay = true;
+        }
+        idx = idx + 1;
+    }
+    testing::expect(saw_resumed_acp);
+    testing::expect(!saw_stale_replay);
+
+    var acp_fb = new_provider_session(allocator, 11, ProviderKind::AntigravityAcp);
+    defer acp_fb.deinit(allocator);
+    var acp_fb_events = array::new<SessionEvent>(allocator);
+    defer acp_fb_events.deinit(allocator);
+    testing::expect(try acp_fb.start_turn(
+        allocator,
+        ProviderKind::AntigravityAcp,
+        "/tmp",
+        "default",
+        ReasoningEffort::Medium,
+        "ses-missing",
+        true,
+        "",
+        "",
+        &overrides,
+        "fallback",
+        &empty_att,
+        &var acp_fb_events
+    ));
+    testing::expect(try poll_until(allocator, &var acp_fb, &var acp_fb_events, SessionEventKind::TurnCompleted));
+    let acp_fb_sid = acp_fb.session_id.as_bytes();
+    testing::expect(mem::equal_bytes(acp_fb_sid, "ses-fresh"));
+
+    var codex_ok = new_provider_session(allocator, 12, ProviderKind::Codex);
+    defer codex_ok.deinit(allocator);
+    var codex_ok_events = array::new<SessionEvent>(allocator);
+    defer codex_ok_events.deinit(allocator);
+    testing::expect(try codex_ok.start_turn(
+        allocator,
+        ProviderKind::Codex,
+        "/tmp",
+        "default",
+        ReasoningEffort::Medium,
+        "codex-valid",
+        true,
+        "",
+        "",
+        &overrides,
+        "continue",
+        &empty_att,
+        &var codex_ok_events
+    ));
+    testing::expect(try poll_until(allocator, &var codex_ok, &var codex_ok_events, SessionEventKind::TurnCompleted));
+    let codex_ok_sid = codex_ok.session_id.as_bytes();
+    testing::expect(mem::equal_bytes(codex_ok_sid, "codex-valid"));
+
+    var codex_fb = new_provider_session(allocator, 13, ProviderKind::Codex);
+    defer codex_fb.deinit(allocator);
+    var codex_fb_events = array::new<SessionEvent>(allocator);
+    defer codex_fb_events.deinit(allocator);
+    testing::expect(try codex_fb.start_turn(
+        allocator,
+        ProviderKind::Codex,
+        "/tmp",
+        "default",
+        ReasoningEffort::Medium,
+        "codex-missing",
+        true,
+        "",
+        "",
+        &overrides,
+        "fallback",
+        &empty_att,
+        &var codex_fb_events
+    ));
+    testing::expect(try poll_until(allocator, &var codex_fb, &var codex_fb_events, SessionEventKind::TurnCompleted));
+    let codex_fb_sid = codex_fb.session_id.as_bytes();
+    testing::expect(mem::equal_bytes(codex_fb_sid, "codex-fresh"));
+}
+
+test "ACP permission request handles string JSON-RPC id and echoes string id in reply" {
+    let allocator = mem::page_allocator();
+    let script =
+        \\import json, sys
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}}), flush=True)
+        \\    elif method == "session/new":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":"agy-ses-1"}}), flush=True)
+        \\    elif method == "session/prompt":
+        \\        pid = msg["id"]
+        \\        print(json.dumps({"jsonrpc":"2.0","method":"session/request_permission","params":{"sessionId":"agy-ses-1","toolCall":{"name":"run_command","kind":"execute","title":"echo ok"},"options":[{"optionId":"allow","kind":"allow_once"},{"optionId":"deny","kind":"reject_once"}]},"id":"1"}), flush=True)
+        \\        perm = json.loads(sys.stdin.readline())
+        \\        assert perm["id"] == "1"
+        \\        assert isinstance(perm["id"], str)
+        \\        assert perm["result"]["outcome"]["optionId"] == "allow"
+        \\        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"agy-ses-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"string id ok"}}}}), flush=True)
+        \\        print(json.dumps({"jsonrpc":"2.0","id":pid,"result":{"stopReason":"end_turn"}}), flush=True)
+    ;
+    var ov_args = string::new(allocator);
+    defer ov_args.deinit(allocator);
+    try ov_args.append_bytes(allocator, "-u");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, "-c");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, script);
+
+    var overrides = array::new<CommandOverride>(allocator);
+    defer overrides.deinit(allocator);
+    let ov_bytes = ov_args.as_bytes();
+    try overrides.append(
+        allocator,
+        try new_command_override(allocator, ProviderKind::AntigravityAcp, "/usr/bin/python3", ov_bytes)
+    );
+
+    var session = new_provider_session(allocator, 21, ProviderKind::AntigravityAcp);
+    defer session.deinit(allocator);
+    var empty_att = array::new<string::String>(allocator);
+    defer empty_att.deinit(allocator);
+    var events = array::new<SessionEvent>(allocator);
+    defer events.deinit(allocator);
+
+    testing::expect(try session.start_turn(
+        allocator,
+        ProviderKind::AntigravityAcp,
+        "/tmp",
+        "default",
+        ReasoningEffort::High,
+        "",
+        true,
+        "",
+        "",
+        &overrides,
+        "run test",
+        &empty_att,
+        &var events
+    ));
+    testing::expect(try poll_until(allocator, &var session, &var events, SessionEventKind::PermissionRequested));
+    testing::expect(session.state == ProviderSessionState::AwaitingPermission);
+    let str_id = session.pending_permission_str_id.as_bytes();
+    testing::expect(mem::equal_bytes(str_id, "1"));
+    testing::expect(try session.resolve_permission(allocator, true));
+    testing::expect(try poll_until(allocator, &var session, &var events, SessionEventKind::TurnCompleted));
+    testing::expect(session.state == ProviderSessionState::Ready);
+}
+
+test "unknown JSON-RPC requests from ACP and Codex receive -32601 immediately without deadlocking" {
+    let allocator = mem::page_allocator();
+    let acp_script =
+        \\import json, sys
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}}), flush=True)
+        \\    elif method == "session/new":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":"unk-acp-1"}}), flush=True)
+        \\    elif method == "session/prompt":
+        \\        pid = msg["id"]
+        \\        print(json.dumps({"jsonrpc":"2.0","id":"req-fs-9","method":"fs/read_text_file","params":{"path":"/tmp/x"}}), flush=True)
+        \\        reply = json.loads(sys.stdin.readline())
+        \\        assert reply["id"] == "req-fs-9"
+        \\        assert reply["error"]["code"] == -32601
+        \\        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"unk-acp-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"recovered acp"}}}}), flush=True)
+        \\        print(json.dumps({"jsonrpc":"2.0","id":pid,"result":{"stopReason":"end_turn"}}), flush=True)
+    ;
+    let codex_script =
+        \\import json, sys
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"id":msg["id"],"result":{"userAgent":"codex-mock"}}), flush=True)
+        \\    elif method == "model/list":
+        \\        print(json.dumps({"id":msg["id"],"result":{"data":[]}}), flush=True)
+        \\    elif method == "thread/start":
+        \\        print(json.dumps({"id":msg["id"],"result":{"thread":{"id":"unk-cdx-1"}}}), flush=True)
+        \\    elif method == "turn/start":
+        \\        print(json.dumps({"id":msg["id"],"result":{"turn":{"id":"t1"}}}), flush=True)
+        \\        print(json.dumps({"id":77,"method":"custom/unsupported","params":{}}), flush=True)
+        \\        reply = json.loads(sys.stdin.readline())
+        \\        assert reply["id"] == 77
+        \\        assert reply["error"]["code"] == -32601
+        \\        print(json.dumps({"method":"item/agentMessage/delta","params":{"delta":"recovered codex"}}), flush=True)
+        \\        print(json.dumps({"method":"turn/completed","params":{"turn":{"status":"completed"}}}), flush=True)
+    ;
+
+    var acp_args = string::new(allocator);
+    defer acp_args.deinit(allocator);
+    try acp_args.append_bytes(allocator, "-u");
+    try acp_args.append_byte(allocator, 31);
+    try acp_args.append_bytes(allocator, "-c");
+    try acp_args.append_byte(allocator, 31);
+    try acp_args.append_bytes(allocator, acp_script);
+
+    var cdx_args = string::new(allocator);
+    defer cdx_args.deinit(allocator);
+    try cdx_args.append_bytes(allocator, "-u");
+    try cdx_args.append_byte(allocator, 31);
+    try cdx_args.append_bytes(allocator, "-c");
+    try cdx_args.append_byte(allocator, 31);
+    try cdx_args.append_bytes(allocator, codex_script);
+
+    var overrides = array::new<CommandOverride>(allocator);
+    defer overrides.deinit(allocator);
+    let acp_b = acp_args.as_bytes();
+    let cdx_b = cdx_args.as_bytes();
+    try overrides.append(
+        allocator,
+        try new_command_override(allocator, ProviderKind::AntigravityAcp, "/usr/bin/python3", acp_b)
+    );
+    try overrides.append(
+        allocator,
+        try new_command_override(allocator, ProviderKind::Codex, "/usr/bin/python3", cdx_b)
+    );
+
+    var empty_att = array::new<string::String>(allocator);
+    defer empty_att.deinit(allocator);
+
+    var acp_s = new_provider_session(allocator, 31, ProviderKind::AntigravityAcp);
+    defer acp_s.deinit(allocator);
+    var acp_ev = array::new<SessionEvent>(allocator);
+    defer acp_ev.deinit(allocator);
+    testing::expect(try acp_s.start_turn(
+        allocator,
+        ProviderKind::AntigravityAcp,
+        "/tmp",
+        "default",
+        ReasoningEffort::Medium,
+        "",
+        true,
+        "",
+        "",
+        &overrides,
+        "test",
+        &empty_att,
+        &var acp_ev
+    ));
+    testing::expect(try poll_until(allocator, &var acp_s, &var acp_ev, SessionEventKind::TurnCompleted));
+
+    var cdx_s = new_provider_session(allocator, 32, ProviderKind::Codex);
+    defer cdx_s.deinit(allocator);
+    var cdx_ev = array::new<SessionEvent>(allocator);
+    defer cdx_ev.deinit(allocator);
+    testing::expect(try cdx_s.start_turn(
+        allocator,
+        ProviderKind::Codex,
+        "/tmp",
+        "default",
+        ReasoningEffort::Medium,
+        "",
+        true,
+        "",
+        "",
+        &overrides,
+        "test",
+        &empty_att,
+        &var cdx_ev
+    ));
+    testing::expect(try poll_until(allocator, &var cdx_s, &var cdx_ev, SessionEventKind::TurnCompleted));
+}

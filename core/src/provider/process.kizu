@@ -1,0 +1,847 @@
+import std::array;
+import std::mem;
+import std::string;
+
+extern "c" fn malloc(size: usize) -> ?ptr<u8>
+extern "c" fn free(p: ptr<u8>) -> void
+extern "c" fn strlen(text: ptr<const u8>) -> usize
+extern "c" fn pipe(ends: &var PipeEnds) -> i32
+extern "c" fn close(descriptor: i32) -> i32
+extern "c" fn dup2(from: i32, to: i32) -> i32
+extern "c" fn read(descriptor: i32, buffer: ptr<u8>, length: usize) -> isize
+extern "c" fn write(descriptor: i32, buffer: ptr<const u8>, length: usize) -> isize
+extern "c" fn poll(entries: &var PollEntry, count: u32, wait_millis: i32) -> i32
+extern "c" fn waitpid(child: i32, status: &var ExitWord, options: i32) -> i32
+extern "c" fn kill(target: i32, signal: i32) -> i32
+extern "c" fn usleep(microseconds: u32) -> i32
+extern "c" fn __error() -> ptr<i32>
+extern "c" fn _NSGetEnviron() -> ptr<usize>
+extern "c" fn posix_spawnp(
+    child: &var ExitWord,
+    file: ptr<const u8>,
+    actions: &SpawnHandle,
+    attributes: &SpawnHandle,
+    arguments: ptr<u8>,
+    environment: ptr<u8>
+) -> i32
+extern "c" fn posix_spawn_file_actions_init(actions: &var SpawnHandle) -> i32
+extern "c" fn posix_spawn_file_actions_destroy(actions: &var SpawnHandle) -> i32
+extern "c" fn posix_spawn_file_actions_adddup2(actions: &var SpawnHandle, from: i32, to: i32) -> i32
+extern "c" fn posix_spawn_file_actions_addopen(
+    actions: &var SpawnHandle,
+    descriptor: i32,
+    path: ptr<const u8>,
+    flags: i32,
+    mode: u16
+) -> i32
+extern "c" fn posix_spawn_file_actions_addchdir_np(actions: &var SpawnHandle, path: ptr<const u8>) -> i32
+extern "c" fn posix_spawnattr_init(attributes: &var SpawnHandle) -> i32
+extern "c" fn posix_spawnattr_destroy(attributes: &var SpawnHandle) -> i32
+extern "c" fn posix_spawnattr_setflags(attributes: &var SpawnHandle, flags: i16) -> i32
+extern "c" fn posix_spawnattr_setpgroup(attributes: &var SpawnHandle, group: i32) -> i32
+extern "c" fn fcntl(descriptor: i32, command: i32, ...) -> i32
+extern "c" fn access(path: ptr<const u8>, mode: i32) -> i32
+extern "c" struct PipeEnds {
+    read_end: i32,
+    write_end: i32,
+}
+
+extern "c" struct PollEntry {
+    descriptor: i32,
+    events: i16,
+    returned: i16,
+}
+
+extern "c" struct ExitWord {
+    value: i32,
+}
+
+extern "c" struct SpawnHandle {
+    value: usize,
+}
+
+pub error PipeError {
+    Unavailable,
+}
+
+pub error PipeFailure = PipeError or mem::Error;
+
+fn process_errno() -> i32 {
+    return unsafe ptr_read(__error());
+}
+
+pub struct ProcessLaunch {
+    pub has_cwd: bool,
+    pub cwd: string::String,
+    pub executable: string::String,
+    pub arguments: array::Array<string::String>,
+    pub environment_keys: array::Array<string::String>,
+    pub environment_values: array::Array<string::String>,
+}
+
+pub fn new_process_launch(allocator: Allocator) -> ProcessLaunch {
+    return ProcessLaunch {
+        has_cwd: false,
+        cwd: string::new(allocator),
+        executable: string::new(allocator),
+        arguments: array::new<string::String>(allocator),
+        environment_keys: array::new<string::String>(allocator),
+        environment_values: array::new<string::String>(allocator)
+    };
+}
+
+pub fn (self: ProcessLaunch) deinit(allocator: Allocator) -> void {
+    self.cwd.deinit(allocator);
+    self.executable.deinit(allocator);
+    self.arguments.deinit(allocator);
+    self.environment_keys.deinit(allocator);
+    self.environment_values.deinit(allocator);
+}
+
+pub fn (self: &var ProcessLaunch) set_cwd(allocator: Allocator, cwd: []u8) -> mem::Error!void {
+    self.cwd.clear();
+    if mem::len(cwd) > 0 {
+        try self.cwd.append_bytes(allocator, cwd);
+        self.has_cwd = true;
+    } else {
+        self.has_cwd = false;
+    }
+    return;
+}
+
+pub fn (self: &var ProcessLaunch) set_executable(allocator: Allocator, program: []u8) -> mem::Error!void {
+    self.executable.clear();
+    try self.executable.append_bytes(allocator, program);
+    return;
+}
+
+pub fn (self: &var ProcessLaunch) add_arg(allocator: Allocator, arg: []u8) -> mem::Error!void {
+    var owned = try string::from_bytes(allocator, arg);
+    errdefer owned.deinit(allocator);
+    try self.arguments.append(allocator, move owned);
+    return;
+}
+
+pub fn (self: &var ProcessLaunch) set_env(allocator: Allocator, key: []u8, value: []u8) -> mem::Error!void {
+    var owned_key = try string::from_bytes(allocator, key);
+    errdefer owned_key.deinit(allocator);
+    var owned_val = try string::from_bytes(allocator, value);
+    errdefer owned_val.deinit(allocator);
+    try self.environment_keys.append(allocator, move owned_key);
+    try self.environment_values.append(allocator, move owned_val);
+    return;
+}
+
+fn append_owned_word(
+    allocator: Allocator,
+    list: &var array::Array<string::String>,
+    text: []u8
+) -> mem::Error!void {
+    var owned = try string::from_bytes(allocator, text);
+    errdefer owned.deinit(allocator);
+    try list.append(allocator, move owned);
+    return;
+}
+
+fn build_argv_words(
+    allocator: Allocator,
+    launch: &ProcessLaunch,
+    entries: &array::Array<string::String>
+) -> mem::Error!array::Array<string::String> {
+    var words = array::new<string::String>(allocator);
+    errdefer words.deinit(allocator);
+    var path_env = string::new(allocator);
+    defer path_env.deinit(allocator);
+    let _ = try find_env_value(allocator, entries, "PATH", &var path_env);
+    var resolved = string::new(allocator);
+    defer resolved.deinit(allocator);
+    let program = launch.executable.as_bytes();
+    let path_bytes = path_env.as_bytes();
+    let _ = try resolve_executable_in_path(allocator, program, path_bytes, &var resolved);
+    let resolved_bytes = resolved.as_bytes();
+    try append_owned_word(allocator, &var words, resolved_bytes);
+    for 0..launch.arguments.len() |index| {
+        if launch.arguments.at(index) |argument| {
+            let bytes = argument.as_bytes();
+            try append_owned_word(allocator, &var words, bytes);
+        }
+    }
+    return move words;
+}
+
+fn set_env_entry(
+    allocator: Allocator,
+    entries: &var array::Array<string::String>,
+    key: []u8,
+    value: []u8
+) -> mem::Error!void {
+    var found: i64 = -1;
+    for 0..entries.len() |index| {
+        if entries.at(index) |entry| {
+            let bytes = entry.as_bytes();
+            if mem::len(bytes) > mem::len(key) and mem::starts_with(bytes, key) and
+                bytes[mem::len(key)] == cast<u8>(61) {
+                found = index;
+            }
+        }
+    }
+    if found >= 0 {
+        if entries.remove(found) |old| {
+            old.deinit(allocator);
+        } else |_| {}
+    }
+    var entry = try string::from_bytes(allocator, key);
+    errdefer entry.deinit(allocator);
+    try entry.append_byte(allocator, 61);
+    try entry.append_bytes(allocator, value);
+    try entries.append(allocator, move entry);
+    return;
+}
+
+fn contains_path_segment(path_val: []u8, dir: []u8) -> bool {
+    let total = mem::len(path_val);
+    let target_len = mem::len(dir);
+    if target_len == 0 {
+        return true;
+    }
+    var start: i64 = 0;
+    while start <= total {
+        var end = start;
+        while end < total and path_val[end] != cast<u8>(58) {
+            end = end + 1;
+        }
+        if end - start == target_len and mem::equal_bytes(path_val[start..end], dir) {
+            return true;
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
+fn path_has_segment(path_buf: &string::String, dir: []u8) -> bool {
+    let existing = path_buf.as_bytes();
+    return contains_path_segment(existing, dir);
+}
+
+fn append_path_if_missing(
+    allocator: Allocator,
+    path_buf: &var string::String,
+    dir: []u8
+) -> mem::Error!void {
+    if mem::len(dir) == 0 {
+        return;
+    }
+    if path_has_segment(path_buf, dir) {
+        return;
+    }
+    if path_buf.len() > 0 {
+        try path_buf.append_byte(allocator, 58);
+    }
+    return path_buf.append_bytes(allocator, dir);
+}
+
+fn append_home_subdir(
+    allocator: Allocator,
+    path_buf: &var string::String,
+    home: &string::String,
+    suffix: []u8
+) -> mem::Error!void {
+    if home.len() == 0 {
+        return;
+    }
+    var joined = string::new(allocator);
+    defer joined.deinit(allocator);
+    try joined.append_string(allocator, home);
+    try joined.append_bytes(allocator, suffix);
+    let bytes = joined.as_bytes();
+    return append_path_if_missing(allocator, path_buf, bytes);
+}
+
+fn find_env_value(
+    allocator: Allocator,
+    entries: &array::Array<string::String>,
+    key: []u8,
+    out: &var string::String
+) -> mem::Error!bool {
+    out.clear();
+    let key_len = mem::len(key);
+    for 0..entries.len() |index| {
+        if entries.at(index) |entry| {
+            let bytes = entry.as_bytes();
+            if mem::len(bytes) > key_len and mem::starts_with(bytes, key) and
+                bytes[key_len] == cast<u8>(61) {
+                try out.append_bytes(allocator, bytes[key_len + 1..mem::len(bytes)]);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn enrich_path_env(
+    allocator: Allocator,
+    entries: &var array::Array<string::String>
+) -> mem::Error!void {
+    var home = string::new(allocator);
+    defer home.deinit(allocator);
+    let _ = try find_env_value(allocator, entries, "HOME", &var home);
+
+    var path_buf = string::new(allocator);
+    defer path_buf.deinit(allocator);
+    let _ = try find_env_value(allocator, entries, "PATH", &var path_buf);
+
+    try append_home_subdir(allocator, &var path_buf, &home, "/.local/bin");
+    try append_home_subdir(allocator, &var path_buf, &home, "/.opencode/bin");
+    try append_home_subdir(allocator, &var path_buf, &home, "/.local/share/kugi/bin");
+    try append_home_subdir(allocator, &var path_buf, &home, "/.cargo/bin");
+    try append_home_subdir(allocator, &var path_buf, &home, "/.nix-profile/bin");
+    try append_path_if_missing(allocator, &var path_buf, "/opt/homebrew/bin");
+    try append_path_if_missing(allocator, &var path_buf, "/usr/local/bin");
+    try append_path_if_missing(allocator, &var path_buf, "/usr/bin");
+    try append_path_if_missing(allocator, &var path_buf, "/bin");
+
+    let final_path = path_buf.as_bytes();
+    return set_env_entry(allocator, entries, "PATH", final_path);
+}
+
+fn has_slash(bytes: []u8) -> bool {
+    for 0..mem::len(bytes) |idx| {
+        if bytes[idx] == cast<u8>(47) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn is_executable_candidate(allocator: Allocator, path: []u8) -> mem::Error!bool {
+    var cstr = try string::from_bytes(allocator, path);
+    defer cstr.deinit(allocator);
+    try cstr.append_byte(allocator, 0);
+    let bytes = cstr.as_bytes();
+    return unsafe access(ptr_of(bytes), 1) == 0;
+}
+
+pub fn resolve_executable_in_path(
+    allocator: Allocator,
+    program: []u8,
+    path_env: []u8,
+    out: &var string::String
+) -> mem::Error!bool {
+    out.clear();
+    if mem::len(program) == 0 {
+        return false;
+    }
+    if has_slash(program) {
+        try out.append_bytes(allocator, program);
+        return true;
+    }
+    let total = mem::len(path_env);
+    var start: i64 = 0;
+    var candidate = string::new(allocator);
+    defer candidate.deinit(allocator);
+    while start <= total {
+        var end = start;
+        while end < total and path_env[end] != cast<u8>(58) {
+            end = end + 1;
+        }
+        if end > start {
+            candidate.clear();
+            try candidate.append_bytes(allocator, path_env[start..end]);
+            if path_env[end - 1] != cast<u8>(47) {
+                try candidate.append_byte(allocator, 47);
+            }
+            try candidate.append_bytes(allocator, program);
+            let cand_bytes = candidate.as_bytes();
+            if try is_executable_candidate(allocator, cand_bytes) {
+                try out.append_bytes(allocator, cand_bytes);
+                return true;
+            }
+        }
+        start = end + 1;
+    }
+    try out.append_bytes(allocator, program);
+    return false;
+}
+
+fn build_child_env(allocator: Allocator, launch: &ProcessLaunch) -> mem::Error!array::Array<string::String> {
+    var entries = array::new<string::String>(allocator);
+    errdefer entries.deinit(allocator);
+    let table = unsafe ptr_read(_NSGetEnviron());
+    if table != 0 {
+        var cursor = unsafe ptr_from_int<ptr<usize>>(table);
+        var reading = true;
+        while reading {
+            let address = unsafe ptr_read(cursor);
+            if address == 0 {
+                reading = false;
+            } else {
+                cursor = unsafe ptr_from_int<ptr<usize>>(int_from_ptr<usize>(cursor) + 8);
+                let text = unsafe ptr_from_int<ptr<const u8>>(address);
+                let length = unsafe strlen(text);
+                let entry = unsafe view_from_ptr(text, cast<i64>(length));
+                try append_owned_word(allocator, &var entries, entry);
+            }
+        }
+    }
+    if launch.has_cwd {
+        let cwd = launch.cwd.as_bytes();
+        try set_env_entry(allocator, &var entries, "PWD", cwd);
+    }
+    for 0..launch.environment_keys.len() |index| {
+        if launch.environment_keys.at(index) |key| {
+            if launch.environment_values.at(index) |value| {
+                let key_bytes = key.as_bytes();
+                let value_bytes = value.as_bytes();
+                try set_env_entry(allocator, &var entries, key_bytes, value_bytes);
+            }
+        }
+    }
+    try enrich_path_env(allocator, &var entries);
+    return move entries;
+}
+
+fn calc_block_bytes(list: &array::Array<string::String>) -> i64 {
+    var total = (list.len() + 1) * 8;
+    for 0..list.len() |index| {
+        if list.at(index) |element| {
+            total = total + element.len() + 1;
+        }
+    }
+    return total;
+}
+
+fn build_pointer_block(list: &array::Array<string::String>) -> ?ptr<u8> {
+    let storage = unsafe malloc(cast<usize>(calc_block_bytes(list))) orelse return null;
+    var next = (list.len() + 1) * 8;
+    for 0..list.len() |index| {
+        let cell = unsafe cast<ptr<usize>>(ptr_offset(storage, index * 8));
+        unsafe ptr_write(cell, int_from_ptr<usize>(ptr_offset(storage, next)));
+        if list.at(index) |element| {
+            let text = element.as_bytes();
+            let length = mem::len(text);
+            let target = unsafe mut_view_from_ptr(ptr_offset(storage, next), length + 1);
+            for 0..length |position| {
+                target[position] = text[position];
+            }
+            target[length] = 0;
+            next = next + length + 1;
+        }
+    }
+    unsafe ptr_write(cast<ptr<usize>>(ptr_offset(storage, list.len() * 8)), 0);
+    return storage;
+}
+
+fn close_fd(descriptor: i32) -> void {
+    if descriptor >= 0 {
+        let _ = unsafe close(descriptor);
+    }
+    return;
+}
+
+fn spawn_child_process(
+    allocator: Allocator,
+    words: &array::Array<string::String>,
+    entries: &array::Array<string::String>,
+    launch: &ProcessLaunch,
+    input: i32,
+    output: i32
+) -> mem::Error!i32 {
+    var cwd = string::new(allocator);
+    defer cwd.deinit(allocator);
+    try cwd.append_string(allocator, &launch.cwd);
+    try cwd.append_byte(allocator, 0);
+    let cwd_bytes = cwd.as_bytes();
+    let arguments = build_pointer_block(words) orelse return mem::Error::OutOfMemory;
+    let environment = build_pointer_block(entries);
+    var child = ExitWord { value: -1 };
+    var actions = SpawnHandle { value: 0 };
+    var attributes = SpawnHandle { value: 0 };
+    var result: i32 = -1;
+    if environment |variables| {
+        let prepared = unsafe posix_spawn_file_actions_init(&var actions) == 0 and
+            unsafe posix_spawnattr_init(&var attributes) == 0;
+        if prepared {
+            let _ = unsafe posix_spawnattr_setflags(&var attributes, 16386);
+            let _ = unsafe posix_spawnattr_setpgroup(&var attributes, 0);
+            let _ = unsafe posix_spawn_file_actions_adddup2(&var actions, input, 0);
+            let _ = unsafe posix_spawn_file_actions_adddup2(&var actions, output, 1);
+            let _ = unsafe posix_spawn_file_actions_addopen(&var actions, 2, c"/dev/null", 1, 0);
+            if launch.has_cwd {
+                let _ = unsafe posix_spawn_file_actions_addchdir_np(&var actions, ptr_of(cwd_bytes));
+            }
+            let program = unsafe ptr_from_int<ptr<const u8>>(ptr_read(cast<ptr<usize>>(arguments)));
+            result = unsafe posix_spawnp(&var child, program, &actions, &attributes, arguments, variables);
+            let _ = unsafe posix_spawn_file_actions_destroy(&var actions);
+            let _ = unsafe posix_spawnattr_destroy(&var attributes);
+        }
+        unsafe free(variables);
+    }
+    unsafe free(arguments);
+    if result != 0 {
+        return -1;
+    }
+    return child.value;
+}
+
+pub struct PipeProcess {
+    child: i32,
+    input: i32,
+    output: i32,
+    quiet_end: i32,
+    ended: bool,
+    exited: bool,
+    exit_code: i64,
+    pending: string::String,
+    consumed: i64,
+}
+
+pub fn empty_pipe_process(allocator: Allocator) -> PipeProcess {
+    return PipeProcess {
+        child: -1,
+        input: -1,
+        output: -1,
+        quiet_end: -1,
+        ended: true,
+        exited: true,
+        exit_code: 0,
+        pending: string::new(allocator),
+        consumed: 0
+    };
+}
+
+pub fn spawn_pipe_process(allocator: Allocator, launch: &ProcessLaunch) -> PipeFailure!PipeProcess {
+    if launch.executable.len() == 0 {
+        return PipeError::Unavailable;
+    }
+    let entries = try build_child_env(allocator, launch);
+    defer entries.deinit(allocator);
+    let words = try build_argv_words(allocator, launch, &entries);
+    defer words.deinit(allocator);
+    var to_child = PipeEnds { read_end: -1, write_end: -1 };
+    var from_child = PipeEnds { read_end: -1, write_end: -1 };
+    let piped = unsafe pipe(&var to_child) == 0 and unsafe pipe(&var from_child) == 0;
+    var child: i32 = -1;
+    if piped {
+        if spawn_child_process(
+            allocator,
+            &words,
+            &entries,
+            launch,
+            to_child.read_end,
+            from_child.write_end
+        ) |started| {
+            child = started;
+        } else |_| {}
+    }
+    close_fd(to_child.read_end);
+    close_fd(from_child.write_end);
+    if child < 0 {
+        close_fd(to_child.write_end);
+        close_fd(from_child.read_end);
+        return PipeError::Unavailable;
+    }
+    let _ = unsafe fcntl(to_child.write_end, 73, cast<i32>(1));
+    return PipeProcess {
+        child: child,
+        input: to_child.write_end,
+        output: from_child.read_end,
+        quiet_end: -1,
+        ended: false,
+        exited: false,
+        exit_code: 0,
+        pending: string::new(allocator),
+        consumed: 0
+    };
+}
+
+fn decode_exit_code(status: i64) -> i64 {
+    let signal = status % 128;
+    if signal == 0 {
+        return status / 256 % 256;
+    }
+    return 128 + signal;
+}
+
+fn reap_child(child: i32, code: &var i64) -> bool {
+    if child <= 0 {
+        return true;
+    }
+    var status = ExitWord { value: 0 };
+    let result = unsafe waitpid(child, &var status, 1);
+    if result == 0 {
+        return false;
+    }
+    code = 1;
+    if result > 0 {
+        code = decode_exit_code(cast<i64>(status.value));
+    }
+    return true;
+}
+
+fn terminate_process_group(child: i32) -> void {
+    if child <= 0 {
+        return;
+    }
+    var code: i64 = 0;
+    if reap_child(child, &var code) {
+        return;
+    }
+    let _ = unsafe kill(0 - child, 15);
+    for 0..15 |_| {
+        if reap_child(child, &var code) {
+            return;
+        }
+        let _ = unsafe usleep(5000);
+    }
+    let _ = unsafe kill(0 - child, 9);
+    var status = ExitWord { value: 0 };
+    let _ = unsafe waitpid(child, &var status, 0);
+    return;
+}
+
+pub fn (self: &var PipeProcess) close_in_place() -> void {
+    close_fd(self.input);
+    self.input = -1;
+    if !self.exited and self.child > 0 {
+        terminate_process_group(self.child);
+    }
+    close_fd(self.output);
+    self.output = -1;
+    close_fd(self.quiet_end);
+    self.quiet_end = -1;
+    self.child = -1;
+    self.ended = true;
+    self.exited = true;
+    self.exit_code = 0;
+    self.pending.clear();
+    self.consumed = 0;
+    return;
+}
+
+pub fn (self: &var PipeProcess) spawn_in_place(
+    allocator: Allocator,
+    launch: &ProcessLaunch
+) -> PipeFailure!void {
+    self.close_in_place();
+    if launch.executable.len() == 0 {
+        return PipeError::Unavailable;
+    }
+    let entries = try build_child_env(allocator, launch);
+    defer entries.deinit(allocator);
+    let words = try build_argv_words(allocator, launch, &entries);
+    defer words.deinit(allocator);
+    var to_child = PipeEnds { read_end: -1, write_end: -1 };
+    var from_child = PipeEnds { read_end: -1, write_end: -1 };
+    let piped = unsafe pipe(&var to_child) == 0 and unsafe pipe(&var from_child) == 0;
+    var child: i32 = -1;
+    if piped {
+        if spawn_child_process(
+            allocator,
+            &words,
+            &entries,
+            launch,
+            to_child.read_end,
+            from_child.write_end
+        ) |started| {
+            child = started;
+        } else |_| {}
+    }
+    close_fd(to_child.read_end);
+    close_fd(from_child.write_end);
+    if child < 0 {
+        close_fd(to_child.write_end);
+        close_fd(from_child.read_end);
+        return PipeError::Unavailable;
+    }
+    let _ = unsafe fcntl(to_child.write_end, 73, cast<i32>(1));
+    self.child = child;
+    self.input = to_child.write_end;
+    self.output = from_child.read_end;
+    self.quiet_end = -1;
+    self.ended = false;
+    self.exited = false;
+    self.exit_code = 0;
+    self.pending.clear();
+    self.consumed = 0;
+    return;
+}
+
+pub fn (self: PipeProcess) deinit(allocator: Allocator) -> void {
+    close_fd(self.input);
+    if !self.exited and self.child > 0 {
+        terminate_process_group(self.child);
+    }
+    close_fd(self.output);
+    close_fd(self.quiet_end);
+    self.pending.deinit(allocator);
+}
+
+pub fn (self: &PipeProcess) is_live() -> bool {
+    return self.child > 0 and !self.exited;
+}
+
+pub fn (self: &PipeProcess) is_ended() -> bool {
+    return self.ended;
+}
+
+pub fn (self: &PipeProcess) wakeup_fd() -> i32 {
+    if self.child <= 0 {
+        return -1;
+    }
+    return self.output;
+}
+
+pub fn (self: &var PipeProcess) poll_exited() -> bool {
+    if !self.exited and self.child > 0 {
+        var code: i64 = 0;
+        if reap_child(self.child, &var code) {
+            self.exited = true;
+            self.exit_code = code;
+        }
+    }
+    return self.exited;
+}
+
+pub fn (self: &PipeProcess) exit_code() -> i64 {
+    return self.exit_code;
+}
+
+pub fn (self: &PipeProcess) send_interrupt() -> void {
+    if !self.exited and self.child > 0 {
+        let _ = unsafe kill(0 - self.child, 2);
+    }
+    return;
+}
+
+pub fn (self: &PipeProcess) write_all(bytes: []u8) -> PipeError!void {
+    if self.input < 0 {
+        return PipeError::Unavailable;
+    }
+    var sent: i64 = 0;
+    while sent < mem::len(bytes) {
+        let rest = bytes[sent..mem::len(bytes)];
+        let count = unsafe write(self.input, ptr_of(rest), cast<usize>(mem::len(rest)));
+        if count > 0 {
+            sent = sent + cast<i64>(count);
+            continue;
+        }
+        if process_errno() == 4 {
+            continue;
+        }
+        return PipeError::Unavailable;
+    }
+    return;
+}
+
+pub fn (self: &PipeProcess) write_line(allocator: Allocator, line: []u8) -> PipeFailure!void {
+    var frame = try string::from_bytes(allocator, line);
+    defer frame.deinit(allocator);
+    try frame.append_byte(allocator, 10);
+    let bytes = frame.as_bytes();
+    return self.write_all(bytes);
+}
+
+fn fd_readable(descriptor: i32) -> bool {
+    if descriptor < 0 {
+        return false;
+    }
+    var entry = PollEntry { descriptor: descriptor, events: 1, returned: 0 };
+    return unsafe poll(&var entry, 1, 0) > 0;
+}
+
+fn (self: &var PipeProcess) quiet_pipe() -> void {
+    self.ended = true;
+    var ends = PipeEnds { read_end: -1, write_end: -1 };
+    if unsafe pipe(&var ends) != 0 {
+        return;
+    }
+    let _ = unsafe dup2(ends.read_end, self.output);
+    close_fd(ends.read_end);
+    self.quiet_end = ends.write_end;
+    return;
+}
+
+pub fn (self: &var PipeProcess) read_available(allocator: Allocator) -> mem::Error!bool {
+    if self.consumed > 0 and self.consumed == self.pending.len() {
+        self.pending.clear();
+        self.consumed = 0;
+    }
+    if self.ended or self.output < 0 {
+        return false;
+    }
+    let storage = unsafe malloc(65536) orelse return mem::Error::OutOfMemory;
+    var changed = false;
+    var failed = false;
+    var reads = 0;
+    while !self.ended and !failed and reads < 64 and fd_readable(self.output) {
+        reads = reads + 1;
+        let count = cast<i64>(unsafe read(self.output, storage, 65536));
+        if count > 0 {
+            let bytes = unsafe view_from_ptr(cast<ptr<const u8>>(storage), count);
+            if self.pending.append_bytes(allocator, bytes) {
+                changed = true;
+            } else |_| {
+                failed = true;
+            }
+        } else if count == 0 or (process_errno() != 4 and process_errno() != 35) {
+            self.quiet_pipe();
+        }
+    }
+    unsafe free(storage);
+    if failed {
+        return mem::Error::OutOfMemory;
+    }
+    return changed;
+}
+
+fn find_pending_line(
+    allocator: Allocator,
+    pending: &string::String,
+    consumed: i64,
+    out: &var string::String
+) -> mem::Error!i64 {
+    let bytes = pending.as_bytes();
+    let total = mem::len(bytes);
+    if consumed >= total {
+        return -2;
+    }
+    var pos = consumed;
+    var found: i64 = -1;
+    while pos < total {
+        if bytes[pos] == cast<u8>(10) {
+            found = pos;
+            break;
+        }
+        pos = pos + 1;
+    }
+    if found < 0 {
+        return -1;
+    }
+    var line_end = found;
+    if line_end > consumed and bytes[line_end - 1] == cast<u8>(13) {
+        line_end = line_end - 1;
+    }
+    try out.append_bytes(allocator, bytes[consumed..line_end]);
+    return found + 1;
+}
+
+pub fn (self: &var PipeProcess) take_line(allocator: Allocator, out: &var string::String) -> mem::Error!bool {
+    out.clear();
+    let next_pos = try find_pending_line(allocator, &self.pending, self.consumed, out);
+    if next_pos == -2 {
+        if self.consumed > 0 {
+            self.pending.clear();
+            self.consumed = 0;
+        }
+        return false;
+    }
+    if next_pos < 0 {
+        return false;
+    }
+    self.consumed = next_pos;
+    if self.consumed >= self.pending.len() {
+        self.pending.clear();
+        self.consumed = 0;
+    }
+    return true;
+}

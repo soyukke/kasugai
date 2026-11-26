@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${KUGI_ACTIVE:-}" ]]; then
+  exec kugi exec -- env KUGI_ACTIVE=1 ./scripts/install-app "$@"
+fi
+
+relaunch=false
+for arg in "$@"; do
+  if [[ "$arg" == "--relaunch" ]]; then
+    relaunch=true
+  fi
+done
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+built_app="$(./scripts/native-app | tail -n 1)"
+install_dir="${KASUGAI_INSTALL_DIR:-/Applications}"
+if [[ ! -w "$install_dir" ]]; then
+  install_dir="$HOME/Applications"
+fi
+mkdir -p "$install_dir"
+
+dest_app="$install_dir/Kasugai.app"
+staging_app="$install_dir/.Kasugai.app.staging.$$"
+cleanup() {
+  rm -rf -- "$staging_app"
+}
+trap cleanup EXIT INT TERM
+
+/usr/bin/ditto "$built_app" "$staging_app"
+/usr/bin/xattr -cr "$staging_app"
+/usr/bin/codesign --verify --deep --strict "$staging_app"
+
+was_running=false
+if pgrep -x Kasugai >/dev/null 2>&1; then
+  was_running=true
+  /usr/bin/osascript -e 'tell application id "dev.soyukke.kasugai" to quit' >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! pgrep -x Kasugai >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+  if pgrep -x Kasugai >/dev/null 2>&1; then
+    pkill -TERM -x Kasugai >/dev/null 2>&1 || true
+    sleep 0.3
+  fi
+fi
+
+rm -rf -- "$dest_app"
+mv "$staging_app" "$dest_app"
+
+lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [[ -x "$lsregister" ]]; then
+  "$lsregister" -f "$dest_app" >/dev/null 2>&1 || true
+fi
+
+if [[ "$relaunch" == true || "$was_running" == true ]]; then
+  opened=false
+  for _ in 1 2 3 4; do
+    if /usr/bin/env -u KASUGAI_THREAD_ID -u KASUGAI_CTL_SOCKET -u KASUGAI_CTL_BIN /usr/bin/open "$dest_app"; then
+      opened=true
+      break
+    fi
+    sleep 0.25
+  done
+  if [[ "$opened" != true ]]; then
+    exit 1
+  fi
+fi
+
+printf '%s\n' "$dest_app"

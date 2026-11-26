@@ -1,0 +1,122 @@
+pub enum TurnMachineState {
+    IdleEmpty,
+    IdleQueued,
+    RunningEmpty,
+    RunningQueued,
+    AwaitingApprovalEmpty,
+    AwaitingApprovalQueued,
+    FailedEmpty,
+    FailedQueued,
+}
+
+pub enum TurnMachineEvent {
+    Enqueue,
+    StartLastQueued,
+    StartMoreQueued,
+    RequestApproval,
+    ApproveTool,
+    DenyTool,
+    CompleteTurn,
+    FailTurn,
+    CancelLastQueued,
+    CancelMoreQueued,
+}
+
+pub enum TurnMachineOutcome {
+    Noop,
+    Queued,
+    TurnStarted,
+    ApprovalRequested,
+    ApprovalGranted,
+    ApprovalDenied,
+    TurnCompleted,
+    TurnFailed,
+    QueueItemRemoved,
+}
+
+pub struct TurnMachineStep {
+    pub state: TurnMachineState,
+    pub outcome: TurnMachineOutcome,
+}
+
+pub fn thread_turn_status_name(state: TurnMachineState) -> []u8 {
+    match state {
+        IdleEmpty => return "idle",
+        IdleQueued => return "idle",
+        RunningEmpty => return "running",
+        RunningQueued => return "running",
+        AwaitingApprovalEmpty => return "awaiting_approval",
+        AwaitingApprovalQueued => return "awaiting_approval",
+        FailedEmpty => return "failed",
+        FailedQueued => return "failed",
+    }
+}
+
+pub fn thread_turn_is_running_or_waiting(state: TurnMachineState) -> bool {
+    match state {
+        RunningEmpty => return true,
+        RunningQueued => return true,
+        AwaitingApprovalEmpty => return true,
+        AwaitingApprovalQueued => return true,
+        _ => return false,
+    }
+}
+
+pub fn thread_turn_advance(state: TurnMachineState, event: TurnMachineEvent) -> TurnMachineStep {
+    match state {
+        IdleEmpty => match event {
+            Enqueue => return TurnMachineStep { state: TurnMachineState::IdleQueued, outcome: TurnMachineOutcome::Queued },
+            _ => return TurnMachineStep { state: TurnMachineState::IdleEmpty, outcome: TurnMachineOutcome::Noop },
+        },
+        IdleQueued => match event {
+            Enqueue => return TurnMachineStep { state: TurnMachineState::IdleQueued, outcome: TurnMachineOutcome::Queued },
+            StartLastQueued => return TurnMachineStep { state: TurnMachineState::RunningEmpty, outcome: TurnMachineOutcome::TurnStarted },
+            StartMoreQueued => return TurnMachineStep { state: TurnMachineState::RunningQueued, outcome: TurnMachineOutcome::TurnStarted },
+            CancelLastQueued => return TurnMachineStep { state: TurnMachineState::IdleEmpty, outcome: TurnMachineOutcome::QueueItemRemoved },
+            CancelMoreQueued => return TurnMachineStep { state: TurnMachineState::IdleQueued, outcome: TurnMachineOutcome::QueueItemRemoved },
+            _ => return TurnMachineStep { state: TurnMachineState::IdleQueued, outcome: TurnMachineOutcome::Noop },
+        },
+        RunningEmpty => match event {
+            Enqueue => return TurnMachineStep { state: TurnMachineState::RunningQueued, outcome: TurnMachineOutcome::Queued },
+            RequestApproval => return TurnMachineStep { state: TurnMachineState::AwaitingApprovalEmpty, outcome: TurnMachineOutcome::ApprovalRequested },
+            CompleteTurn => return TurnMachineStep { state: TurnMachineState::IdleEmpty, outcome: TurnMachineOutcome::TurnCompleted },
+            FailTurn => return TurnMachineStep { state: TurnMachineState::FailedEmpty, outcome: TurnMachineOutcome::TurnFailed },
+            _ => return TurnMachineStep { state: TurnMachineState::RunningEmpty, outcome: TurnMachineOutcome::Noop },
+        },
+        RunningQueued => match event {
+            Enqueue => return TurnMachineStep { state: TurnMachineState::RunningQueued, outcome: TurnMachineOutcome::Queued },
+            RequestApproval => return TurnMachineStep { state: TurnMachineState::AwaitingApprovalQueued, outcome: TurnMachineOutcome::ApprovalRequested },
+            CompleteTurn => return TurnMachineStep { state: TurnMachineState::IdleQueued, outcome: TurnMachineOutcome::TurnCompleted },
+            FailTurn => return TurnMachineStep { state: TurnMachineState::FailedQueued, outcome: TurnMachineOutcome::TurnFailed },
+            CancelLastQueued => return TurnMachineStep { state: TurnMachineState::RunningEmpty, outcome: TurnMachineOutcome::QueueItemRemoved },
+            CancelMoreQueued => return TurnMachineStep { state: TurnMachineState::RunningQueued, outcome: TurnMachineOutcome::QueueItemRemoved },
+            _ => return TurnMachineStep { state: TurnMachineState::RunningQueued, outcome: TurnMachineOutcome::Noop },
+        },
+        AwaitingApprovalEmpty => match event {
+            Enqueue => return TurnMachineStep { state: TurnMachineState::AwaitingApprovalQueued, outcome: TurnMachineOutcome::Queued },
+            ApproveTool => return TurnMachineStep { state: TurnMachineState::RunningEmpty, outcome: TurnMachineOutcome::ApprovalGranted },
+            DenyTool => return TurnMachineStep { state: TurnMachineState::FailedEmpty, outcome: TurnMachineOutcome::ApprovalDenied },
+            _ => return TurnMachineStep { state: TurnMachineState::AwaitingApprovalEmpty, outcome: TurnMachineOutcome::Noop },
+        },
+        AwaitingApprovalQueued => match event {
+            Enqueue => return TurnMachineStep { state: TurnMachineState::AwaitingApprovalQueued, outcome: TurnMachineOutcome::Queued },
+            ApproveTool => return TurnMachineStep { state: TurnMachineState::RunningQueued, outcome: TurnMachineOutcome::ApprovalGranted },
+            DenyTool => return TurnMachineStep { state: TurnMachineState::FailedQueued, outcome: TurnMachineOutcome::ApprovalDenied },
+            CancelLastQueued => return TurnMachineStep { state: TurnMachineState::AwaitingApprovalEmpty, outcome: TurnMachineOutcome::QueueItemRemoved },
+            CancelMoreQueued => return TurnMachineStep { state: TurnMachineState::AwaitingApprovalQueued, outcome: TurnMachineOutcome::QueueItemRemoved },
+            _ => return TurnMachineStep { state: TurnMachineState::AwaitingApprovalQueued, outcome: TurnMachineOutcome::Noop },
+        },
+        FailedEmpty => match event {
+            Enqueue => return TurnMachineStep { state: TurnMachineState::FailedQueued, outcome: TurnMachineOutcome::Queued },
+            _ => return TurnMachineStep { state: TurnMachineState::FailedEmpty, outcome: TurnMachineOutcome::Noop },
+        },
+        FailedQueued => match event {
+            Enqueue => return TurnMachineStep { state: TurnMachineState::FailedQueued, outcome: TurnMachineOutcome::Queued },
+            StartLastQueued => return TurnMachineStep { state: TurnMachineState::RunningEmpty, outcome: TurnMachineOutcome::TurnStarted },
+            StartMoreQueued => return TurnMachineStep { state: TurnMachineState::RunningQueued, outcome: TurnMachineOutcome::TurnStarted },
+            CancelLastQueued => return TurnMachineStep { state: TurnMachineState::FailedEmpty, outcome: TurnMachineOutcome::QueueItemRemoved },
+            CancelMoreQueued => return TurnMachineStep { state: TurnMachineState::FailedQueued, outcome: TurnMachineOutcome::QueueItemRemoved },
+            _ => return TurnMachineStep { state: TurnMachineState::FailedQueued, outcome: TurnMachineOutcome::Noop },
+        },
+    }
+}

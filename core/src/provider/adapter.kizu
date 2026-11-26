@@ -1,0 +1,343 @@
+import std::array;
+import std::fmt;
+import std::json;
+import std::mem;
+import std::string;
+
+pub enum ProviderKind {
+    LocalEcho,
+    OpenCodeAcp,
+    AntigravityAcp,
+    ClaudeCode,
+    Codex,
+}
+
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+pub fn provider_id(kind: ProviderKind) -> []u8 {
+    if kind == ProviderKind::LocalEcho {
+        return "local_echo";
+    }
+    if kind == ProviderKind::OpenCodeAcp {
+        return "opencode_acp";
+    }
+    if kind == ProviderKind::AntigravityAcp {
+        return "antigravity_acp";
+    }
+    if kind == ProviderKind::ClaudeCode {
+        return "claude_code";
+    }
+    return "codex";
+}
+
+pub fn provider_display_name(kind: ProviderKind) -> []u8 {
+    if kind == ProviderKind::LocalEcho {
+        return "Local Echo";
+    }
+    if kind == ProviderKind::OpenCodeAcp {
+        return "OpenCode (ACP)";
+    }
+    if kind == ProviderKind::AntigravityAcp {
+        return "Antigravity (ACP)";
+    }
+    if kind == ProviderKind::ClaudeCode {
+        return "Claude Code";
+    }
+    return "Codex";
+}
+
+pub fn provider_transport(kind: ProviderKind) -> []u8 {
+    if kind == ProviderKind::LocalEcho {
+        return "in_process";
+    }
+    if kind == ProviderKind::OpenCodeAcp or kind == ProviderKind::AntigravityAcp {
+        return "acp_stdio";
+    }
+    if kind == ProviderKind::ClaudeCode {
+        return "claude_stream_json";
+    }
+    return "codex_app_server";
+}
+
+pub fn provider_executable(kind: ProviderKind) -> []u8 {
+    if kind == ProviderKind::LocalEcho {
+        return "in-process";
+    }
+    if kind == ProviderKind::OpenCodeAcp {
+        return "opencode";
+    }
+    if kind == ProviderKind::AntigravityAcp {
+        return "agy";
+    }
+    if kind == ProviderKind::ClaudeCode {
+        return "claude";
+    }
+    return "codex";
+}
+
+pub fn provider_base_args(kind: ProviderKind) -> []u8 {
+    if kind == ProviderKind::LocalEcho {
+        return "";
+    }
+    if kind == ProviderKind::OpenCodeAcp {
+        return "acp";
+    }
+    if kind == ProviderKind::AntigravityAcp {
+        return "acp";
+    }
+    if kind == ProviderKind::ClaudeCode {
+        return "-p --verbose --input-format stream-json --output-format stream-json --include-partial-messages --permission-prompts host";
+    }
+    return "app-server --stdio";
+}
+
+pub fn provider_telemetry_args(kind: ProviderKind, suppress_telemetry: bool) -> []u8 {
+    if !suppress_telemetry {
+        return "";
+    }
+    if kind == ProviderKind::AntigravityAcp {
+        return "--disable-telemetry";
+    }
+    return "";
+}
+
+pub fn provider_telemetry_env(kind: ProviderKind, suppress_telemetry: bool) -> []u8 {
+    if !suppress_telemetry {
+        return "";
+    }
+    if kind == ProviderKind::OpenCodeAcp {
+        return "OPENCODE_DISABLE_TELEMETRY=1";
+    }
+    if kind == ProviderKind::AntigravityAcp {
+        return "AGY_DISABLE_TELEMETRY=1";
+    }
+    if kind == ProviderKind::ClaudeCode {
+        return "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1";
+    }
+    if kind == ProviderKind::Codex {
+        return "CODEX_DISABLE_TELEMETRY=1";
+    }
+    return "";
+}
+
+pub fn provider_default_model(kind: ProviderKind) -> []u8 {
+    if kind == ProviderKind::LocalEcho {
+        return "local-echo";
+    }
+    if kind == ProviderKind::OpenCodeAcp {
+        return "default";
+    }
+    if kind == ProviderKind::AntigravityAcp {
+        return "default";
+    }
+    if kind == ProviderKind::ClaudeCode {
+        return "default";
+    }
+    return "default";
+}
+
+pub fn provider_ready(kind: ProviderKind) -> bool {
+    let _ = kind;
+    return true;
+}
+
+pub fn is_acp_provider(kind: ProviderKind) -> bool {
+    return kind == ProviderKind::OpenCodeAcp or kind == ProviderKind::AntigravityAcp;
+}
+
+pub fn parse_provider(bytes: []u8, out: &var ProviderKind) -> bool {
+    if mem::equal_bytes(bytes, "local_echo") {
+        out = ProviderKind::LocalEcho;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "opencode_acp") {
+        out = ProviderKind::OpenCodeAcp;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "antigravity_acp") {
+        out = ProviderKind::AntigravityAcp;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "claude_code") {
+        out = ProviderKind::ClaudeCode;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "codex") {
+        out = ProviderKind::Codex;
+        return true;
+    }
+    return false;
+}
+
+pub fn effort_id(effort: ReasoningEffort) -> []u8 {
+    if effort == ReasoningEffort::Low {
+        return "low";
+    }
+    if effort == ReasoningEffort::Medium {
+        return "medium";
+    }
+    if effort == ReasoningEffort::High {
+        return "high";
+    }
+    return "xhigh";
+}
+
+pub fn claude_effort_id(effort: ReasoningEffort) -> []u8 {
+    if effort == ReasoningEffort::Low {
+        return "low";
+    }
+    if effort == ReasoningEffort::Medium {
+        return "medium";
+    }
+    if effort == ReasoningEffort::High {
+        return "high";
+    }
+    return "max";
+}
+
+pub fn parse_effort(bytes: []u8, out: &var ReasoningEffort) -> bool {
+    if mem::equal_bytes(bytes, "low") {
+        out = ReasoningEffort::Low;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "medium") {
+        out = ReasoningEffort::Medium;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "high") {
+        out = ReasoningEffort::High;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "xhigh") {
+        out = ReasoningEffort::XHigh;
+        return true;
+    }
+    return false;
+}
+
+pub fn format_launch_spec(
+    allocator: Allocator,
+    kind: ProviderKind,
+    suppress_telemetry: bool,
+    out: &var string::String
+) -> mem::Error!void {
+    let env_spec = provider_telemetry_env(kind, suppress_telemetry);
+    if mem::len(env_spec) > 0 {
+        try out.append_bytes(allocator, env_spec);
+        try out.append_bytes(allocator, " ");
+    }
+    try out.append_bytes(allocator, provider_executable(kind));
+    let base = provider_base_args(kind);
+    if mem::len(base) > 0 {
+        try out.append_bytes(allocator, " ");
+        try out.append_bytes(allocator, base);
+    }
+    let telemetry_args = provider_telemetry_args(kind, suppress_telemetry);
+    if mem::len(telemetry_args) > 0 {
+        try out.append_bytes(allocator, " ");
+        try out.append_bytes(allocator, telemetry_args);
+    }
+    return;
+}
+
+pub struct LocalTurnOutput {
+    pub chunks: array::Array<string::String>,
+    pub final_text: string::String,
+}
+
+pub fn (self: LocalTurnOutput) deinit(allocator: Allocator) -> void {
+    self.chunks.deinit(allocator);
+    self.final_text.deinit(allocator);
+}
+
+pub fn execute_local_turn(
+    allocator: Allocator,
+    kind: ProviderKind,
+    model: []u8,
+    effort: ReasoningEffort,
+    prompt: []u8,
+    attachment_count: i64,
+    suppress_telemetry: bool
+) -> mem::Error!LocalTurnOutput {
+    let _ = suppress_telemetry;
+    var chunks = array::new<string::String>(allocator);
+    errdefer chunks.deinit(allocator);
+    var full = string::new(allocator);
+    errdefer full.deinit(allocator);
+
+    var header = string::new(allocator);
+    errdefer header.deinit(allocator);
+    try header.append_bytes(allocator, "[");
+    try header.append_bytes(allocator, provider_display_name(kind));
+    try header.append_bytes(allocator, " / ");
+    if mem::len(model) > 0 {
+        try header.append_bytes(allocator, model);
+    } else {
+        try header.append_bytes(allocator, provider_default_model(kind));
+    }
+    try header.append_bytes(allocator, " / ");
+    try header.append_bytes(allocator, effort_id(effort));
+    try header.append_bytes(allocator, "]");
+    try header.append_byte(allocator, 10);
+    try header.append_byte(allocator, 10);
+
+    var body = string::new(allocator);
+    errdefer body.deinit(allocator);
+    try body.append_bytes(allocator, prompt);
+
+    if attachment_count > 0 {
+        try body.append_byte(allocator, 10);
+        try body.append_byte(allocator, 10);
+        try body.append_bytes(allocator, "ローカル添付: ");
+        try fmt::append_i64(allocator, &var body, attachment_count);
+        try body.append_bytes(allocator, " 件");
+    }
+
+    try full.append_string(allocator, &header);
+    try chunks.append(allocator, move header);
+
+    try full.append_string(allocator, &body);
+    try chunks.append(allocator, move body);
+
+    return LocalTurnOutput {
+        chunks: move chunks,
+        final_text: move full
+    };
+}
+
+fn write_provider_entry(
+    allocator: Allocator,
+    encoder: &var json::Encoder,
+    kind: ProviderKind,
+    suppress_telemetry: bool
+) -> mem::Error!void {
+    try encoder.begin_object();
+    try encoder.write_bytes_field("id", provider_id(kind));
+    try encoder.write_bytes_field("display_name", provider_display_name(kind));
+    try encoder.write_bytes_field("transport", provider_transport(kind));
+    try encoder.write_bytes_field("default_model", provider_default_model(kind));
+    try encoder.write_bool_field("ready", provider_ready(kind));
+    var spec = string::new(allocator);
+    defer spec.deinit(allocator);
+    try format_launch_spec(allocator, kind, suppress_telemetry, &var spec);
+    let spec_bytes = spec.as_bytes();
+    try encoder.write_bytes_field("launch_spec", spec_bytes);
+    return encoder.end_object();
+}
+
+pub fn write_catalog_json(
+    allocator: Allocator,
+    encoder: &var json::Encoder,
+    suppress_telemetry: bool
+) -> mem::Error!void {
+    try write_provider_entry(allocator, encoder, ProviderKind::LocalEcho, suppress_telemetry);
+    try write_provider_entry(allocator, encoder, ProviderKind::OpenCodeAcp, suppress_telemetry);
+    try write_provider_entry(allocator, encoder, ProviderKind::AntigravityAcp, suppress_telemetry);
+    try write_provider_entry(allocator, encoder, ProviderKind::ClaudeCode, suppress_telemetry);
+    return write_provider_entry(allocator, encoder, ProviderKind::Codex, suppress_telemetry);
+}

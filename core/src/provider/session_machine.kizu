@@ -1,0 +1,213 @@
+pub enum ProviderSessionState {
+    Disconnected,
+    Initializing,
+    SessionCreating,
+    Ready,
+    Prompting,
+    AwaitingPermission,
+    Failed,
+}
+
+pub enum ProviderSessionEvent {
+    SpawnHandshake,
+    SpawnDirectPrompt,
+    InitializeOk,
+    SessionReady,
+    SendPrompt,
+    ReceiveDelta,
+    RequestPermission,
+    ResolvePermissionAllow,
+    ResolvePermissionDeny,
+    CompleteTurn,
+    CancelTurn,
+    FailTransport,
+    Disconnect,
+}
+
+pub enum ProviderSessionOutcome {
+    Noop,
+    HandshakeStarted,
+    DirectPromptStarted,
+    SessionCreationStarted,
+    SessionBecameReady,
+    PromptDispatched,
+    DeltaAccepted,
+    PermissionPending,
+    PermissionAllowed,
+    PermissionDenied,
+    TurnFinished,
+    TurnCancelled,
+    TransportFailed,
+    SessionDisconnected,
+}
+
+pub struct ProviderSessionStep {
+    pub state: ProviderSessionState,
+    pub outcome: ProviderSessionOutcome,
+}
+
+pub fn provider_session_state_name(state: ProviderSessionState) -> []u8 {
+    match state {
+        Disconnected => return "disconnected",
+        Initializing => return "initializing",
+        SessionCreating => return "session_creating",
+        Ready => return "ready",
+        Prompting => return "prompting",
+        AwaitingPermission => return "awaiting_permission",
+        Failed => return "failed",
+    }
+}
+
+pub fn provider_session_advance(
+    state: ProviderSessionState,
+    event: ProviderSessionEvent
+) -> ProviderSessionStep {
+    match state {
+        Disconnected => match event {
+            SpawnHandshake => return ProviderSessionStep {
+                state: ProviderSessionState::Initializing,
+                outcome: ProviderSessionOutcome::HandshakeStarted
+            },
+            SpawnDirectPrompt => return ProviderSessionStep {
+                state: ProviderSessionState::Prompting,
+                outcome: ProviderSessionOutcome::DirectPromptStarted
+            },
+            FailTransport => return ProviderSessionStep {
+                state: ProviderSessionState::Failed,
+                outcome: ProviderSessionOutcome::TransportFailed
+            },
+            _ => return ProviderSessionStep {
+                state: ProviderSessionState::Disconnected,
+                outcome: ProviderSessionOutcome::Noop
+            },
+        },
+        Initializing => match event {
+            InitializeOk => return ProviderSessionStep {
+                state: ProviderSessionState::SessionCreating,
+                outcome: ProviderSessionOutcome::SessionCreationStarted
+            },
+            FailTransport => return ProviderSessionStep {
+                state: ProviderSessionState::Failed,
+                outcome: ProviderSessionOutcome::TransportFailed
+            },
+            Disconnect => return ProviderSessionStep {
+                state: ProviderSessionState::Disconnected,
+                outcome: ProviderSessionOutcome::SessionDisconnected
+            },
+            _ => return ProviderSessionStep {
+                state: ProviderSessionState::Initializing,
+                outcome: ProviderSessionOutcome::Noop
+            },
+        },
+        SessionCreating => match event {
+            SessionReady => return ProviderSessionStep {
+                state: ProviderSessionState::Ready,
+                outcome: ProviderSessionOutcome::SessionBecameReady
+            },
+            FailTransport => return ProviderSessionStep {
+                state: ProviderSessionState::Failed,
+                outcome: ProviderSessionOutcome::TransportFailed
+            },
+            Disconnect => return ProviderSessionStep {
+                state: ProviderSessionState::Disconnected,
+                outcome: ProviderSessionOutcome::SessionDisconnected
+            },
+            _ => return ProviderSessionStep {
+                state: ProviderSessionState::SessionCreating,
+                outcome: ProviderSessionOutcome::Noop
+            },
+        },
+        Ready => match event {
+            SendPrompt => return ProviderSessionStep {
+                state: ProviderSessionState::Prompting,
+                outcome: ProviderSessionOutcome::PromptDispatched
+            },
+            FailTransport => return ProviderSessionStep {
+                state: ProviderSessionState::Failed,
+                outcome: ProviderSessionOutcome::TransportFailed
+            },
+            Disconnect => return ProviderSessionStep {
+                state: ProviderSessionState::Disconnected,
+                outcome: ProviderSessionOutcome::SessionDisconnected
+            },
+            _ => return ProviderSessionStep {
+                state: ProviderSessionState::Ready,
+                outcome: ProviderSessionOutcome::Noop
+            },
+        },
+        Prompting => match event {
+            ReceiveDelta => return ProviderSessionStep {
+                state: ProviderSessionState::Prompting,
+                outcome: ProviderSessionOutcome::DeltaAccepted
+            },
+            RequestPermission => return ProviderSessionStep {
+                state: ProviderSessionState::AwaitingPermission,
+                outcome: ProviderSessionOutcome::PermissionPending
+            },
+            CompleteTurn => return ProviderSessionStep {
+                state: ProviderSessionState::Ready,
+                outcome: ProviderSessionOutcome::TurnFinished
+            },
+            CancelTurn => return ProviderSessionStep {
+                state: ProviderSessionState::Ready,
+                outcome: ProviderSessionOutcome::TurnCancelled
+            },
+            FailTransport => return ProviderSessionStep {
+                state: ProviderSessionState::Failed,
+                outcome: ProviderSessionOutcome::TransportFailed
+            },
+            Disconnect => return ProviderSessionStep {
+                state: ProviderSessionState::Disconnected,
+                outcome: ProviderSessionOutcome::SessionDisconnected
+            },
+            _ => return ProviderSessionStep {
+                state: ProviderSessionState::Prompting,
+                outcome: ProviderSessionOutcome::Noop
+            },
+        },
+        AwaitingPermission => match event {
+            ResolvePermissionAllow => return ProviderSessionStep {
+                state: ProviderSessionState::Prompting,
+                outcome: ProviderSessionOutcome::PermissionAllowed
+            },
+            ResolvePermissionDeny => return ProviderSessionStep {
+                state: ProviderSessionState::Ready,
+                outcome: ProviderSessionOutcome::PermissionDenied
+            },
+            CancelTurn => return ProviderSessionStep {
+                state: ProviderSessionState::Ready,
+                outcome: ProviderSessionOutcome::TurnCancelled
+            },
+            FailTransport => return ProviderSessionStep {
+                state: ProviderSessionState::Failed,
+                outcome: ProviderSessionOutcome::TransportFailed
+            },
+            Disconnect => return ProviderSessionStep {
+                state: ProviderSessionState::Disconnected,
+                outcome: ProviderSessionOutcome::SessionDisconnected
+            },
+            _ => return ProviderSessionStep {
+                state: ProviderSessionState::AwaitingPermission,
+                outcome: ProviderSessionOutcome::Noop
+            },
+        },
+        Failed => match event {
+            SpawnHandshake => return ProviderSessionStep {
+                state: ProviderSessionState::Initializing,
+                outcome: ProviderSessionOutcome::HandshakeStarted
+            },
+            SpawnDirectPrompt => return ProviderSessionStep {
+                state: ProviderSessionState::Prompting,
+                outcome: ProviderSessionOutcome::DirectPromptStarted
+            },
+            Disconnect => return ProviderSessionStep {
+                state: ProviderSessionState::Disconnected,
+                outcome: ProviderSessionOutcome::SessionDisconnected
+            },
+            _ => return ProviderSessionStep {
+                state: ProviderSessionState::Failed,
+                outcome: ProviderSessionOutcome::Noop
+            },
+        },
+    }
+}

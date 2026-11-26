@@ -1,0 +1,483 @@
+import std::array;
+import std::mem;
+import std::process;
+import std::string;
+
+extern "c" struct Winsize {
+    rows: u16,
+    cols: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+}
+
+extern "c" struct Descriptor {
+    value: i32,
+}
+
+extern "c" struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+extern "c" struct PtyPipeEnds {
+    read_end: i32,
+    write_end: i32,
+}
+
+extern "c" struct SignalSet {
+    bits: u32,
+}
+
+extern "c" struct Passwd {
+    name: ?ptr<const u8>,
+    password: ?ptr<const u8>,
+    uid: u32,
+    gid: u32,
+    change: i64,
+    class: ?ptr<const u8>,
+    gecos: ?ptr<const u8>,
+    directory: ?ptr<const u8>,
+    shell: ?ptr<const u8>,
+    expire: i64,
+}
+
+extern "c" fn forkpty(master: &var Descriptor, name: ?ptr<u8>, termios: ?ptr<u8>, size: &Winsize) -> i32
+extern "c" fn execvp(file: ptr<const u8>, argv: ptr<u8>) -> i32
+extern "c" fn _exit(code: i32) -> void
+extern "c" fn chdir(path: ptr<u8>) -> i32
+extern "c" fn read(fd: i32, out: ptr<u8>, length: usize) -> isize
+extern "c" fn write(fd: i32, bytes: ptr<const u8>, length: usize) -> isize
+extern "c" fn close(fd: i32) -> i32
+extern "c" fn dup2(from: i32, to: i32) -> i32
+extern "c" fn pipe(out: &var PtyPipeEnds) -> i32
+extern "c" fn poll(fds: &var PollFd, count: u32, timeout: i32) -> i32
+extern "c" fn waitpid(pid: i32, status: &var Descriptor, options: i32) -> i32
+extern "c" fn kill(pid: i32, number: i32) -> i32
+extern "c" fn usleep(micros: u32) -> i32
+extern "c" fn signal(number: i32, handler: usize) -> usize
+extern "c" fn sigprocmask(how: i32, set: &SignalSet, old: ?ptr<u8>) -> i32
+extern "c" fn getdtablesize() -> i32
+extern "c" fn getuid() -> u32
+extern "c" fn getpwuid(uid: u32) -> ?ptr<Passwd>
+extern "c" fn strlen(text: ptr<const u8>) -> usize
+extern "c" fn __error() -> ptr<i32>
+extern "c" fn _NSGetEnviron() -> ptr<usize>
+extern "c" fn ioctl(fd: i32, request: u64, ...) -> i32
+extern "c" fn fcntl(fd: i32, command: i32, ...) -> i32
+pub error PtyError {
+    Unavailable,
+}
+
+pub error PtyFailure = PtyError or mem::Error;
+
+fn pty_errno() -> i32 {
+    return unsafe ptr_read(__error());
+}
+unsafe fn append_c_str(
+    allocator: Allocator,
+    out: &var string::String,
+    text: ptr<const u8>
+) -> mem::Error!void {
+    let length = unsafe strlen(text);
+    let bytes = unsafe view_from_ptr(text, cast<i64>(length));
+    return out.append_bytes(allocator, bytes);
+}
+
+fn append_default_shell(allocator: Allocator, out: &var string::String) -> mem::Error!void {
+    if unsafe getpwuid(getuid()) |record| {
+        if unsafe record.*.shell |shell| {
+            let before = out.len();
+            try unsafe append_c_str(allocator, out, shell);
+            if out.len() > before {
+                return;
+            }
+        }
+    }
+    if process::env("SHELL") |sh| {
+        if mem::len(sh) > 0 {
+            return out.append_bytes(allocator, sh);
+        }
+    }
+    return out.append_bytes(allocator, "/bin/zsh");
+}
+
+fn append_word_item(
+    allocator: Allocator,
+    list: &var array::Array<string::String>,
+    bytes: []u8
+) -> mem::Error!void {
+    var owned = try string::from_bytes(allocator, bytes);
+    errdefer owned.deinit(allocator);
+    return list.append(allocator, move owned);
+}
+
+fn set_env_var(
+    allocator: Allocator,
+    entries: &var array::Array<string::String>,
+    key: []u8,
+    value: []u8
+) -> mem::Error!void {
+    var found: i64 = -1;
+    for 0..entries.len() |index| {
+        if entries.at(index) |entry| {
+            let bytes = entry.as_bytes();
+            if mem::len(bytes) > mem::len(key) and mem::starts_with(bytes, key) and
+                bytes[mem::len(key)] == cast<u8>(61) {
+                found = index;
+            }
+        }
+    }
+    if found >= 0 {
+        if entries.remove(found) |old| {
+            old.deinit(allocator);
+        } else |_| {}
+    }
+    var entry = try string::from_bytes(allocator, key);
+    errdefer entry.deinit(allocator);
+    try entry.append_byte(allocator, 61);
+    try entry.append_bytes(allocator, value);
+    return entries.append(allocator, move entry);
+}
+
+fn remove_env_var(
+    allocator: Allocator,
+    entries: &var array::Array<string::String>,
+    key: []u8
+) -> void {
+    var index: i64 = entries.len() - 1;
+    while index >= 0 {
+        var match_key = false;
+        if entries.at(index) |entry| {
+            let bytes = entry.as_bytes();
+            if mem::len(bytes) > mem::len(key) and mem::starts_with(bytes, key) and
+                bytes[mem::len(key)] == cast<u8>(61) {
+                match_key = true;
+            }
+        }
+        if match_key {
+            if entries.remove(index) |old| {
+                old.deinit(allocator);
+            } else |_| {}
+        }
+        index = index - 1;
+    }
+    return;
+}
+
+fn build_pty_env(
+    allocator: Allocator,
+    cwd: []u8,
+    shell: []u8
+) -> mem::Error!array::Array<string::String> {
+    var entries = array::new<string::String>(allocator);
+    errdefer entries.deinit(allocator);
+    let table = unsafe ptr_read(_NSGetEnviron());
+    if table != 0 {
+        var cursor = unsafe ptr_from_int<ptr<usize>>(table);
+        var entry = string::new(allocator);
+        defer entry.deinit(allocator);
+        while true {
+            let address = unsafe ptr_read(cursor);
+            if address == 0 {
+                break;
+            }
+            entry.clear();
+            try unsafe append_c_str(allocator, &var entry, ptr_from_int<ptr<const u8>>(address));
+            let bytes = entry.as_bytes();
+            try append_word_item(allocator, &var entries, bytes);
+            cursor = unsafe ptr_offset(cursor, 1);
+        }
+    }
+    remove_env_var(allocator, &var entries, "KASUGAI_THREAD_ID");
+    remove_env_var(allocator, &var entries, "KASUGAI_CTL_SOCKET");
+    remove_env_var(allocator, &var entries, "KASUGAI_CTL_BIN");
+    try set_env_var(allocator, &var entries, "TERM", "xterm-256color");
+    try set_env_var(allocator, &var entries, "COLORTERM", "truecolor");
+    try set_env_var(allocator, &var entries, "SHELL", shell);
+    if mem::len(cwd) > 0 {
+        try set_env_var(allocator, &var entries, "PWD", cwd);
+    }
+    return move entries;
+}
+unsafe struct ExecBlock {
+    storage: ptr<u8>,
+    argv: ptr<u8>,
+    envp: ptr<u8>,
+    directory: ?ptr<u8>,
+}
+
+fn list_total_bytes(list: &array::Array<string::String>) -> i64 {
+    var total: i64 = 0;
+    for 0..list.len() |index| {
+        if list.at(index) |element| {
+            total = total + element.len() + 1;
+        }
+    }
+    return total;
+}
+unsafe fn write_nul_bytes(storage: ptr<u8>, offset: i64, text: []u8) -> i64 {
+    let length = mem::len(text);
+    let target = unsafe mut_view_from_ptr(ptr_offset(storage, offset), length + 1);
+    for 0..length |index| {
+        target[index] = text[index];
+    }
+    target[length] = 0;
+    return offset + length + 1;
+}
+unsafe fn write_ptr_list(
+    storage: ptr<u8>,
+    slot: i64,
+    offset: i64,
+    list: &array::Array<string::String>
+) -> i64 {
+    var next = offset;
+    for 0..list.len() |index| {
+        let cell = unsafe cast<ptr<usize>>(ptr_offset(storage, (slot + index) * 8));
+        let address = unsafe int_from_ptr<usize>(ptr_offset(storage, next));
+        unsafe ptr_write(cell, address);
+        if list.at(index) |element| {
+            let bytes = element.as_bytes();
+            next = unsafe write_nul_bytes(storage, next, bytes);
+        }
+    }
+    unsafe ptr_write(cast<ptr<usize>>(ptr_offset(storage, (slot + list.len()) * 8)), 0);
+    return next;
+}
+
+fn build_exec_block(
+    arguments: &array::Array<string::String>,
+    environment: &array::Array<string::String>,
+    directory: []u8
+) -> mem::Error!ExecBlock {
+    let slots = arguments.len() + 1 + environment.len() + 1;
+    let strings = list_total_bytes(arguments) + list_total_bytes(environment) + mem::len(directory) + 1;
+    let storage = unsafe malloc(cast<usize>(slots * 8 + strings)) orelse return mem::Error::OutOfMemory;
+    var offset = slots * 8;
+    offset = unsafe write_ptr_list(storage, 0, offset, arguments);
+    offset = unsafe write_ptr_list(storage, arguments.len() + 1, offset, environment);
+    var start: ?ptr<u8> = null;
+    if mem::len(directory) > 0 {
+        start = unsafe ptr_offset(storage, offset);
+    }
+    let _ = unsafe write_nul_bytes(storage, offset, directory);
+    let envp = unsafe ptr_offset(storage, (arguments.len() + 1) * 8);
+    return unsafe ExecBlock { storage: storage, argv: storage, envp: envp, directory: start };
+}
+unsafe fn exec_pty_child(block: &ExecBlock) -> void {
+    for 1..32 |number| {
+        if number != 9 and number != 17 {
+            let _ = unsafe signal(cast<i32>(number), 0);
+        }
+    }
+    let unblocked = SignalSet { bits: 0 };
+    let _ = unsafe sigprocmask(3, &unblocked, null);
+    var limit = unsafe getdtablesize();
+    if limit > 65536 {
+        limit = 65536;
+    }
+    for 3..cast<i64>(limit) |descriptor| {
+        let _ = unsafe close(cast<i32>(descriptor));
+    }
+    if block.directory |directory| {
+        let _ = unsafe chdir(directory);
+    }
+    unsafe ptr_write(_NSGetEnviron(), int_from_ptr<usize>(block.envp));
+    let program = unsafe ptr_from_int<ptr<const u8>>(ptr_read(cast<ptr<usize>>(block.argv)));
+    let _ = unsafe execvp(program, block.argv);
+    unsafe _exit(127);
+    return;
+}
+
+pub struct Pty {
+    master: i32,
+    child: i32,
+    quiet_end: i32,
+    ended: bool,
+    exited: bool,
+}
+
+pub fn spawn_pty(
+    allocator: Allocator,
+    cwd: []u8,
+    command: []u8,
+    cols: u16,
+    rows: u16
+) -> PtyFailure!Pty {
+    var shell = string::new(allocator);
+    defer shell.deinit(allocator);
+    try append_default_shell(allocator, &var shell);
+    let shell_bytes = shell.as_bytes();
+
+    var args = array::new<string::String>(allocator);
+    defer args.deinit(allocator);
+    if mem::len(command) > 0 {
+        try append_word_item(allocator, &var args, "/bin/sh");
+        try append_word_item(allocator, &var args, "-c");
+        try append_word_item(allocator, &var args, command);
+    } else {
+        try append_word_item(allocator, &var args, shell_bytes);
+        try append_word_item(allocator, &var args, "-l");
+        try append_word_item(allocator, &var args, "-i");
+    }
+
+    let env = try build_pty_env(allocator, cwd, shell_bytes);
+    defer env.deinit(allocator);
+
+    let block = try build_exec_block(&args, &env, cwd);
+    var master = Descriptor { value: -1 };
+    let size = Winsize { rows: rows, cols: cols, pixel_width: 0, pixel_height: 0 };
+    let child = unsafe forkpty(&var master, null, null, &size);
+    if child == 0 {
+        unsafe exec_pty_child(&block);
+    }
+    unsafe free(block.storage);
+    if child < 0 {
+        return PtyError::Unavailable;
+    }
+    let _ = unsafe fcntl(master.value, 2, cast<i32>(1));
+    return Pty {
+        master: master.value,
+        child: child,
+        quiet_end: -1,
+        ended: false,
+        exited: false
+    };
+}
+
+fn pty_child_reaped(child: i32) -> bool {
+    if child <= 0 {
+        return true;
+    }
+    var status = Descriptor { value: 0 };
+    return unsafe waitpid(child, &var status, 1) != 0;
+}
+
+fn terminate_pty_child(child: i32) -> void {
+    if pty_child_reaped(child) {
+        return;
+    }
+    let _ = unsafe kill(0 - child, 15);
+    for 0..15 |_| {
+        if pty_child_reaped(child) {
+            return;
+        }
+        let _ = unsafe usleep(5000);
+    }
+    let _ = unsafe kill(0 - child, 9);
+    let _ = unsafe kill(child, 9);
+    var status = Descriptor { value: 0 };
+    let _ = unsafe waitpid(child, &var status, 0);
+    return;
+}
+
+pub fn (self: Pty) deinit() -> void {
+    if self.master >= 0 {
+        let _ = unsafe close(self.master);
+    }
+    if self.quiet_end >= 0 {
+        let _ = unsafe close(self.quiet_end);
+    }
+    if !self.exited and self.child > 0 {
+        terminate_pty_child(self.child);
+    }
+}
+
+pub fn (self: &Pty) wakeup_fd() -> i32 {
+    return self.master;
+}
+
+pub fn (self: &Pty) resize(cols: u16, rows: u16) -> bool {
+    if self.ended or self.master < 0 {
+        return false;
+    }
+    let size = Winsize { rows: rows, cols: cols, pixel_width: 0, pixel_height: 0 };
+    return unsafe ioctl(self.master, 2148037735, &size) == 0;
+}
+
+fn pty_ready(descriptor: i32, events: i16, wait_ms: i32) -> bool {
+    var entry = PollFd { fd: descriptor, events: events, revents: 0 };
+    return unsafe poll(&var entry, 1, wait_ms) > 0;
+}
+
+pub fn (self: &var Pty) write_all(bytes: []u8) -> bool {
+    if self.ended or self.master < 0 {
+        return false;
+    }
+    var sent: i64 = 0;
+    while sent < mem::len(bytes) {
+        let rest = bytes[sent..mem::len(bytes)];
+        let count = unsafe write(self.master, ptr_of(rest), cast<usize>(mem::len(rest)));
+        if count > 0 {
+            sent = sent + cast<i64>(count);
+            continue;
+        }
+        let reason = pty_errno();
+        if reason == 4 {
+            continue;
+        }
+        if reason == 35 {
+            let _ = pty_ready(self.master, 4, 50);
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn (self: &var Pty) quiet_pty() -> void {
+    self.ended = true;
+    var ends = PtyPipeEnds { read_end: -1, write_end: -1 };
+    if unsafe pipe(&var ends) != 0 {
+        return;
+    }
+    let _ = unsafe dup2(ends.read_end, self.master);
+    let _ = unsafe close(ends.read_end);
+    self.quiet_end = ends.write_end;
+    return;
+}
+
+pub fn (self: &var Pty) read_available(
+    allocator: Allocator,
+    out: &var string::String
+) -> mem::Error!bool {
+    if self.ended or self.master < 0 {
+        return false;
+    }
+    let buf = unsafe malloc(16384) orelse return mem::Error::OutOfMemory;
+    var changed = false;
+    var failed = false;
+    var reads: i64 = 0;
+    while !self.ended and !failed and reads < 64 and pty_ready(self.master, 1, 0) {
+        reads = reads + 1;
+        let count = cast<i64>(unsafe read(self.master, buf, 16384));
+        if count > 0 {
+            let chunk = unsafe view_from_ptr(cast<ptr<const u8>>(buf), count);
+            if out.append_bytes(allocator, chunk) {
+                changed = true;
+            } else |_| {
+                failed = true;
+            }
+            continue;
+        }
+        if count < 0 {
+            let reason = pty_errno();
+            if reason == 4 or reason == 35 {
+                break;
+            }
+        }
+        self.quiet_pty();
+    }
+    unsafe free(buf);
+    if failed {
+        return mem::Error::OutOfMemory;
+    }
+    return changed;
+}
+
+pub fn (self: &var Pty) poll_exited() -> bool {
+    if !self.exited and pty_child_reaped(self.child) {
+        self.exited = true;
+    }
+    return self.exited;
+}

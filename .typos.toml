@@ -1,0 +1,8 @@
+[default.extend-words]
+kasugai = "kasugai"
+kizu = "kizu"
+kugi = "kugi"
+agy = "agy"
+
+[files]
+extend-exclude = ["core/**/*_test.kizu", "kugi.lock"]

@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$repo_root/core/spec"
+
+if ! command -v tlc >/dev/null 2>&1; then
+  echo "spec-verify: tlc is required (run \`kugi sync\` and invoke via \`just spec-verify\`)" >&2
+  exit 1
+fi
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/kasugai-spec-verify.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
+run_safety_group() {
+  local module="$1"
+  shift
+  local run_dir="$work/safety-${module}"
+  mkdir -p "$run_dir"
+  {
+    printf 'SPECIFICATION Spec\n'
+    for inv in "$@"; do
+      printf 'INVARIANT %s\n' "$inv"
+    done
+  } >"$run_dir/$module.cfg"
+
+  if ! output="$(tlc -config "$run_dir/$module.cfg" -metadir "$run_dir/states" -workers 1 "$module.tla" 2>&1)"; then
+    echo "$output"
+    echo "spec-verify: $module safety invariant violated" >&2
+    exit 1
+  fi
+  summary="$(printf '%s\n' "$output" | grep 'distinct states found' | tail -n 1 || true)"
+  echo "$module ($# safety invariants): $summary"
+}
+
+run_reachability_group() {
+  local module="$1"
+  shift
+  local run_dir="$work/reach-${module}"
+  mkdir -p "$run_dir"
+  {
+    printf 'SPECIFICATION Spec\n'
+    for inv in "$@"; do
+      printf 'INVARIANT %s\n' "$inv"
+    done
+  } >"$run_dir/$module.cfg"
+
+  if ! output="$(tlc -continue -config "$run_dir/$module.cfg" -metadir "$run_dir/states" -workers 1 "$module.tla" 2>&1)"; then
+    true
+  fi
+  if ! printf '%s\n' "$output" | grep -q 'distinct states found'; then
+    echo "$output"
+    echo "spec-verify: $module: TLC did not finish reachability check" >&2
+    exit 1
+  fi
+  for inv in "$@"; do
+    if ! printf '%s\n' "$output" | grep -q "Invariant $inv is violated"; then
+      echo "$output"
+      echo "spec-verify: $module:$inv held unexpectedly (target state is unreachable)" >&2
+      exit 1
+    fi
+  done
+  echo "$module ($# reachability witnesses): all reachable"
+}
+
+run_safety_group thread_turn_properties \
+  TypeOK \
+  noOverlapTurnStart \
+  enqueuePreservesPhase \
+  finishPreservesQueue \
+  approvalRequestedOnlyWhileRunning \
+  approvalDecisionSound \
+  cancelPreservesPhase \
+  noopNeverMutatesState
+
+run_safety_group provider_session_properties \
+  TypeOK \
+  handshakeOrdering \
+  promptOnlyAfterReadyOrDirect \
+  deltaOnlyWhilePrompting \
+  permissionOnlyWhilePrompting \
+  permissionDecisionSound \
+  turnFinishOnlyWhilePrompting \
+  noopNeverMutatesState
+
+run_safety_group webview_sync_properties \
+  TypeOK \
+  failClosedIsAbsorbing \
+  loadPageOnlyAfterRulesCompile \
+  renderOnlyWhenPageReady \
+  staleRenderAlwaysRedraws \
+  crashRecoveryPreservesPending \
+  noopNeverMutatesState
+
+run_safety_group sync_loop_properties \
+  TypeOK \
+  noIdleBroadcastDiffLoop \
+  unchangedStatsNeverBroadcast \
+  turnFinishRefreshesDiffOnce \
+  diffCompletionAlwaysQuiescesWhenIdle \
+  emitStatsOnlyWhenChanged
+
+run_safety_group mobile_bridge_properties \
+  TypeOK \
+  unauthorizedAlwaysRevokesAuthenticated \
+  revokedNeverAutoReconnects \
+  staleSyncAlwaysRefetches \
+  disconnectAlwaysUnpairs \
+  fetchOnlyWhenAuthorized \
+  noopNeverMutatesState
+
+run_safety_group factory_run_properties \
+  TypeOK \
+  noDoubleRunnerStart \
+  noDoublePublish \
+  publishedNeverDiscarded \
+  detachedReloadAlwaysPolls \
+  uiReloadNeverKillsRunning \
+  publishFailureAlwaysMarksFailed \
+  noopNeverMutatesState
+
+run_reachability_group thread_turn_properties \
+  neverMidTurnQueueComplete \
+  neverApprovalGranted \
+  neverApprovalDenied \
+  neverQueueCancelledWhileRunning
+
+run_reachability_group provider_session_properties \
+  neverHandshakeCompleted \
+  neverDirectPromptFinished \
+  neverPermissionAllowed \
+  neverPermissionDenied \
+  neverRecoveredAfterFailure
+
+run_reachability_group webview_sync_properties \
+  neverRenderComplete \
+  neverStaleRedraw \
+  neverCrashRecovery \
+  neverBlockedFailClosed
+
+run_reachability_group sync_loop_properties \
+  neverTurnFinishRefresh \
+  neverSuppressUnchanged \
+  neverEmitStatsChanged \
+  neverBusyDiffOpen
+
+run_reachability_group mobile_bridge_properties \
+  neverPaired \
+  neverConnected \
+  neverStaleRefetch \
+  neverRecoveredFromDrop \
+  neverRevoked
+
+run_reachability_group factory_run_properties \
+  neverLaunched \
+  neverResumedPollAfterRestart \
+  neverPreviewReady \
+  neverPublished \
+  neverDiscarded \
+  neverFailedFromPublish \
+  neverRecoveredAfterFailure
+
+run_concurrency_group() {
+  local module="$1"
+  local run_dir="$work/conc-${module}"
+  mkdir -p "$run_dir"
+  cat >"$run_dir/$module.cfg" <<'EOF'
+SPECIFICATION FairSpec
+INVARIANT TypeOK
+INVARIANT AtMostOneDaemon
+INVARIANT LockMatchesLiveDaemon
+INVARIANT ActiveTurnNeverLosesDaemon
+INVARIANT DoneHasNoPendingProviderWait
+PROPERTY UnknownRpcAlwaysAnswered
+PROPERTY ApprovalSurvivesGuiRestart
+PROPERTY TurnEventuallyTerminates
+PROPERTY DiffSyncEventuallyQuiesces
+EOF
+
+  if ! output="$(tlc -config "$run_dir/$module.cfg" -metadir "$run_dir/states" -workers 1 "$module.tla" 2>&1)"; then
+    echo "$output"
+    echo "spec-verify: $module concurrency/liveness property violated" >&2
+    exit 1
+  fi
+  summary="$(printf '%s\n' "$output" | grep 'distinct states found' | tail -n 1 || true)"
+  echo "$module (5 safety + 4 temporal liveness properties): $summary"
+}
+
+run_concurrency_group daemon_concurrency
+
+echo "spec verify (TLA+ / TLC): ok"

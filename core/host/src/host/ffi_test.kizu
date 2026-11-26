@@ -1,0 +1,78 @@
+import kasugai::engine;
+import std::mem;
+import std::testing;
+
+fn is_live(handle: ?ptr<engine::Core>) -> bool {
+    if handle |_| {
+        return true;
+    }
+    return false;
+}
+
+fn has_substring(text: ?ptr<u8>, needle: []u8) -> bool {
+    let live = text orelse return false;
+    let start = unsafe cast<ptr<const u8>>(live);
+    let length = cast<i64>(unsafe strlen(start));
+    let bytes = unsafe view_from_ptr(start, length);
+    let n_len = mem::len(needle);
+    var found = false;
+    if n_len <= length {
+        var i: i64 = 0;
+        while i <= length - n_len {
+            if mem::equal_bytes(bytes[i..i + n_len], needle) {
+                found = true;
+                break;
+            }
+            i = i + 1;
+        }
+    }
+    kasugai_string_free(text);
+    return found;
+}
+
+test "C ABI lifecycle creates projects, threads, sends messages, and exports JSONL" {
+    let core = kasugai_core_create(c"Kasugai", c"/workspace/kasugai");
+    testing::expect(is_live(core));
+
+    let project_id = kasugai_core_add_project(core, c"Demo", c"/tmp/demo");
+    testing::expect_equal<i64>(2, project_id);
+
+    let thread_id = kasugai_core_create_thread(
+        core,
+        project_id,
+        c"Test Thread",
+        c"local_echo",
+        c"local-echo",
+        c"high"
+    );
+    testing::expect_equal<i64>(2, thread_id);
+    testing::expect(kasugai_core_select_thread(core, thread_id) == 1);
+    testing::expect(kasugai_core_rename_thread(core, thread_id, c"Renamed Thread") == 1);
+
+    let q_id = kasugai_core_enqueue_message(core, thread_id, c"queued hello", null);
+    testing::expect(q_id > 0);
+    testing::expect(has_substring(kasugai_core_snapshot_json(core), "queued hello"));
+    testing::expect(kasugai_core_process_next_queued(core, thread_id) == 1);
+    testing::expect(has_substring(kasugai_core_events_jsonl(core, thread_id), "turn.completed"));
+
+    let s_id = kasugai_core_send_message(core, thread_id, c"direct hello", c"/tmp/img.png");
+    testing::expect(s_id > q_id);
+    testing::expect(has_substring(kasugai_core_snapshot_json(core), "direct hello"));
+    testing::expect(kasugai_core_bind_worktree(core, thread_id, c"feat/m1", c"main", c"/tmp/wt") == 1);
+    testing::expect(kasugai_core_update_diff_stats(core, thread_id, 3, 20, 4) == 1);
+    testing::expect(has_substring(kasugai_core_snapshot_json(core), "/tmp/wt"));
+    testing::expect(kasugai_core_reset_worktree(core, thread_id) == 1);
+
+    kasugai_core_destroy(core);
+}
+
+test "C ABI refuses null handles cleanly" {
+    testing::expect_equal<i64>(-1, kasugai_core_add_project(null, c"a", c"/tmp"));
+    testing::expect(kasugai_core_select_thread(null, 1) == 0);
+    testing::expect_equal<i64>(-1, kasugai_core_send_message(null, 1, c"hi", null));
+    testing::expect(kasugai_core_poll_providers(null) == 0);
+    testing::expect(!has_substring(kasugai_core_provider_wakeup_fds(null), "thread_id"));
+    testing::expect(!has_substring(kasugai_core_snapshot_json(null), "threads"));
+    kasugai_core_destroy(null);
+    kasugai_string_free(null);
+}

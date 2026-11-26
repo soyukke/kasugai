@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${KUGI_ACTIVE:-}" ]]; then
+  exec kugi exec -- env KUGI_ACTIVE=1 ./scripts/watch-dev "$@"
+fi
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+project_dir="${1:-$repo_root}"
+
+echo "[watch-dev] launching Kasugai Dev.app (view-renderer hot reload enabled)..."
+./scripts/dev-relaunch "$project_dir" >/dev/null
+echo "[watch-dev] watching Swift / Kizu sources (view-renderer updates apply live without restart)"
+
+python3 - "$repo_root" "$project_dir" <<'PY'
+import os
+import subprocess
+import sys
+import time
+
+repo_root = sys.argv[1]
+project_dir = sys.argv[2]
+
+native_roots = [
+    os.path.join(repo_root, "app", "Sources"),
+    os.path.join(repo_root, "core", "src"),
+    os.path.join(repo_root, "core", "host", "src"),
+]
+native_files = [
+    os.path.join(repo_root, "core", "build.kizu"),
+    os.path.join(repo_root, "core", "host", "build.kizu"),
+    os.path.join(repo_root, "app", "Info.plist.in"),
+    os.path.join(repo_root, "app", "Kasugai.entitlements"),
+    os.path.join(repo_root, "VERSION"),
+]
+renderer_files = [
+    os.path.join(repo_root, "view-renderer", "index.html"),
+    os.path.join(repo_root, "view-renderer", "kasugai-view.css"),
+    os.path.join(repo_root, "view-renderer", "kasugai-view.js"),
+]
+
+
+def stat_file(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def snapshot_native():
+    state = {}
+    for root in native_roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for name in filenames:
+                if name.endswith((".swift", ".kizu")):
+                    path = os.path.join(dirpath, name)
+                    st = stat_file(path)
+                    if st is not None:
+                        state[path] = st
+    for path in native_files:
+        st = stat_file(path)
+        if st is not None:
+            state[path] = st
+    return state
+
+
+def snapshot_renderer():
+    return {path: stat_file(path) for path in renderer_files}
+
+
+last_native = snapshot_native()
+last_renderer = snapshot_renderer()
+
+try:
+    while True:
+        time.sleep(0.4)
+        cur_renderer = snapshot_renderer()
+        if cur_renderer != last_renderer:
+            last_renderer = cur_renderer
+            print(
+                "[watch-dev] view-renderer changed -> live reload in Kasugai Dev.app",
+                flush=True,
+            )
+
+        cur_native = snapshot_native()
+        if cur_native != last_native:
+            time.sleep(0.15)
+            last_native = snapshot_native()
+            started = time.monotonic()
+            print("[watch-dev] native source changed -> rebuilding Kasugai Dev.app...", flush=True)
+            result = subprocess.run(
+                [os.path.join(repo_root, "scripts", "dev-relaunch"), "--background", project_dir]
+            )
+            elapsed = time.monotonic() - started
+            if result.returncode == 0:
+                print(
+                    f"[watch-dev] relaunched Kasugai Dev.app in {elapsed:.1f}s",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[watch-dev] build failed (exit {result.returncode}); waiting for next edit...",
+                    flush=True,
+                )
+except KeyboardInterrupt:
+    print("\n[watch-dev] stopped", flush=True)
+PY

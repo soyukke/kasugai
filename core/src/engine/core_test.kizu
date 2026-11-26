@@ -1,0 +1,453 @@
+import kasugai::provider;
+import std::fmt;
+import std::machine;
+import std::mem;
+import std::string;
+import std::testing;
+
+extern "c" fn getpid() -> i32
+extern "c" fn unlink(path: ptr<const u8>) -> i32
+extern "c" fn usleep(microseconds: u32) -> i32
+fn contains_bytes(haystack: []u8, needle: []u8) -> bool {
+    let h_len = mem::len(haystack);
+    let n_len = mem::len(needle);
+    if n_len == 0 {
+        return true;
+    }
+    if n_len > h_len {
+        return false;
+    }
+    var i: i64 = 0;
+    while i <= h_len - n_len {
+        if mem::equal_bytes(haystack[i..i + n_len], needle) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+test "default core starts with one project, one thread, and telemetry suppressed" {
+    let allocator = mem::page_allocator();
+    var core = try new_core(allocator, "Kasugai", "/workspace/kasugai");
+    defer core.deinit(allocator);
+
+    testing::expect_equal<i64>(1, core.projects.len());
+    testing::expect_equal<i64>(1, core.threads.len());
+    testing::expect_equal<i64>(1, core.active_project_id);
+    testing::expect_equal<i64>(1, core.active_thread_id);
+    testing::expect(core.suppress_telemetry);
+
+    var snap = string::new(allocator);
+    defer snap.deinit(allocator);
+    try core.snapshot_json(allocator, &var snap);
+    let bytes = snap.as_bytes();
+    testing::expect(contains_bytes(bytes,
+        \\"suppress_telemetry":true
+    ));
+    testing::expect(contains_bytes(bytes,
+        \\"opencode_acp"
+    ));
+    testing::expect(contains_bytes(bytes,
+        \\"antigravity_acp"
+    ));
+}
+
+test "send message processes local echo, emits unified events, and updates snapshot" {
+    let allocator = mem::page_allocator();
+    var core = try new_core(allocator, "Kasugai", "/workspace/kasugai");
+    defer core.deinit(allocator);
+
+    let turn_id = try core.send_message(allocator, 1, "こんにちは Kasugai", "/tmp/screen.png");
+    testing::expect_equal<i64>(1, turn_id);
+
+    if core.threads.at(0) |thread| {
+        testing::expect(thread.machine_state == TurnMachineState::IdleEmpty);
+        testing::expect_equal<i64>(0, thread.queue.len());
+        testing::expect_equal<i64>(2, thread.messages.len());
+        if thread.messages.at(0) |user_msg| {
+            testing::expect(user_msg.role == MessageRole::User);
+            testing::expect_equal<i64>(1, user_msg.attachments.len());
+        } else {
+            testing::fail("missing user message");
+        }
+        if thread.messages.at(1) |assistant_msg| {
+            testing::expect(assistant_msg.role == MessageRole::Assistant);
+            let a_bytes = assistant_msg.text.as_bytes();
+            testing::expect(contains_bytes(a_bytes, "こんにちは Kasugai"));
+            testing::expect(contains_bytes(a_bytes, "ローカル添付: 1 件"));
+        } else {
+            testing::fail("missing assistant message");
+        }
+    } else {
+        testing::fail("missing default thread");
+    }
+
+    var jsonl = string::new(allocator);
+    defer jsonl.deinit(allocator);
+    try core.store.export_jsonl(allocator, 1, &var jsonl);
+    let log_bytes = jsonl.as_bytes();
+    testing::expect(contains_bytes(log_bytes, "turn.enqueued"));
+    testing::expect(contains_bytes(log_bytes, "turn.started"));
+    testing::expect(contains_bytes(log_bytes, "message.user"));
+    testing::expect(contains_bytes(log_bytes, "message.delta"));
+    testing::expect(contains_bytes(log_bytes, "message.completed"));
+    testing::expect(contains_bytes(log_bytes, "turn.completed"));
+}
+
+test "mid-turn queue holds follow-up turns in FIFO order across running and approval states" {
+    let allocator = mem::page_allocator();
+    var core = try new_core(allocator, "Kasugai", "/workspace/kasugai");
+    defer core.deinit(allocator);
+
+    let t1 = try core.enqueue_turn(allocator, 1, "first task", "");
+    testing::expect_equal<i64>(1, t1);
+    testing::expect_equal<i64>(1, try core.begin_next_queued_turn(allocator, 1));
+
+    let t2 = try core.send_message(allocator, 1, "second task", "");
+    let t3 = try core.send_message(allocator, 1, "third task", "");
+    testing::expect_equal<i64>(2, t2);
+    testing::expect_equal<i64>(3, t3);
+
+    testing::expect(try core.request_tool_approval(allocator, 1, "shell", "git status"));
+    if core.threads.at(0) |thread| {
+        testing::expect(thread.machine_state == TurnMachineState::AwaitingApprovalQueued);
+        testing::expect_equal<i64>(2, thread.queue.len());
+    }
+    testing::expect(try core.resolve_tool_approval(allocator, 1, true));
+    if core.threads.at(0) |thread| {
+        testing::expect(thread.machine_state == TurnMachineState::RunningQueued);
+    }
+
+    testing::expect(core.cancel_queued_turn(allocator, 1, t3));
+    if core.threads.at(0) |thread| {
+        testing::expect_equal<i64>(1, thread.queue.len());
+    }
+
+    testing::expect(try core.append_active_delta(allocator, 1, "done 1"));
+    testing::expect(try core.finish_active_turn(allocator, 1, ""));
+    if core.threads.at(0) |thread| {
+        testing::expect(thread.machine_state == TurnMachineState::IdleQueued);
+        testing::expect_equal<i64>(1, thread.queue.len());
+    }
+
+    testing::expect(try core.process_next_queued(allocator, 1));
+    if core.threads.at(0) |thread| {
+        testing::expect(thread.machine_state == TurnMachineState::IdleEmpty);
+        testing::expect_equal<i64>(0, thread.queue.len());
+        testing::expect_equal<i64>(4, thread.messages.len());
+    }
+}
+
+test "live ACP engine pumps mid-turn FIFO queue and replays JSONL store across restarts" {
+    let allocator = mem::page_allocator();
+    var store_path = try string::from_bytes(allocator, "/tmp/kasugai-engine-replay-");
+    defer store_path.deinit(allocator);
+    try fmt::append_i64(allocator, &var store_path, cast<i64>(unsafe getpid()));
+    try store_path.append_bytes(allocator, ".jsonl");
+
+    var c_path = string::new(allocator);
+    defer c_path.deinit(allocator);
+    try c_path.append_string(allocator, &store_path);
+    try c_path.append_byte(allocator, 0);
+    let c_bytes = c_path.as_bytes();
+    let _ = unsafe unlink(ptr_of(c_bytes));
+
+    let script =
+        \\import json, sys
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}}), flush=True)
+        \\    elif method == "session/new":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":"ses-q","configOptions":[{"id":"model","category":"model","currentValue":"m/a","options":[{"value":"m/a"},{"value":"m/b"}]}]}}), flush=True)
+        \\    elif method == "session/prompt":
+        \\        text = msg["params"]["prompt"][0]["text"]
+        \\        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses-q","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"echo:" + text}}}}), flush=True)
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn"}}), flush=True)
+    ;
+    var ov_args = string::new(allocator);
+    defer ov_args.deinit(allocator);
+    try ov_args.append_bytes(allocator, "-u");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, "-c");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, script);
+    let ov_bytes = ov_args.as_bytes();
+    let store_bytes = store_path.as_bytes();
+
+    if true {
+        var core = try new_core_with_store(allocator, "Kasugai", "/tmp", store_bytes);
+        defer core.deinit(allocator);
+        try core.set_provider_command_override(
+            allocator,
+            provider::ProviderKind::OpenCodeAcp,
+            "/usr/bin/python3",
+            ov_bytes
+        );
+        let th2 = try core.create_thread(
+            allocator,
+            1,
+            "ACP Queue",
+            provider::ProviderKind::OpenCodeAcp,
+            "default",
+            provider::ReasoningEffort::High
+        );
+        testing::expect_equal<i64>(2, th2);
+        testing::expect(try core.bind_worktree(allocator, th2, "feat/acp", "main", "/tmp"));
+        testing::expect(try core.rename_thread(allocator, th2, "ACP Renamed"));
+
+        let _ = try core.send_message(allocator, th2, "turn one", "");
+        let _ = try core.send_message(allocator, th2, "turn two", "");
+
+        var done = false;
+        for 0..160 |_| {
+            let _ = try core.poll_providers(allocator);
+            if core.threads.at(1) |thread| {
+                if thread.machine_state == TurnMachineState::IdleEmpty and thread.messages.len() == 4 {
+                    done = true;
+                    break;
+                }
+            }
+            let _ = unsafe usleep(5000);
+        }
+        testing::expect(done);
+
+        var fds = string::new(allocator);
+        defer fds.deinit(allocator);
+        try core.provider_wakeup_fds_json(allocator, &var fds);
+        let fd_bytes = fds.as_bytes();
+        testing::expect(contains_bytes(fd_bytes,
+            \\"thread_id":2
+        ));
+    }
+
+    var reloaded = try new_core_with_store(allocator, "Kasugai", "/tmp", store_bytes);
+    defer reloaded.deinit(allocator);
+    testing::expect_equal<i64>(1, reloaded.projects.len());
+    testing::expect_equal<i64>(2, reloaded.threads.len());
+    if reloaded.threads.at(1) |thread| {
+        testing::expect_equal<i64>(4, thread.messages.len());
+        testing::expect(thread.provider == provider::ProviderKind::OpenCodeAcp);
+        testing::expect(thread.updated_at_ms > 0);
+        let title_bytes = thread.title.as_bytes();
+        testing::expect(mem::equal_bytes(title_bytes, "ACP Renamed"));
+        let branch_bytes = thread.workspace.branch.as_bytes();
+        testing::expect(mem::equal_bytes(branch_bytes, "feat/acp"));
+    } else {
+        testing::fail("missing replayed thread 2");
+    }
+
+    let _ = unsafe unlink(ptr_of(c_bytes));
+}
+
+fn turn_machine_next(state: TurnMachineState, ev: TurnMachineEvent) -> TurnMachineState {
+    return thread_turn_advance(state, ev).state;
+}
+
+fn turn_machine_outcome(state: TurnMachineState, ev: TurnMachineEvent) -> TurnMachineOutcome {
+    return thread_turn_advance(state, ev).outcome;
+}
+
+fn turn_machine_never_ends(state: TurnMachineState) -> bool {
+    let _ = state;
+    return false;
+}
+
+test "every state of thread_turn_advance is reachable with no table problems" {
+    let allocator = mem::page_allocator();
+    let table = try machine::answers<TurnMachineState, TurnMachineEvent, TurnMachineOutcome>(
+        allocator,
+        turn_machine_next,
+        turn_machine_outcome,
+        TurnMachineState::IdleEmpty,
+        turn_machine_never_ends
+    );
+    defer table.deinit(allocator);
+    var problems = try table.problems(allocator);
+    defer problems.deinit(allocator);
+    if problems.at(0) |line| {
+        let bytes = line.as_bytes();
+        testing::fail(bytes);
+    }
+}
+
+test "auto approve tools resolves incoming ACP permission requests and pending approvals" {
+    let allocator = mem::page_allocator();
+    var core = try new_core(allocator, "Kasugai", "/tmp");
+    defer core.deinit(allocator);
+
+    testing::expect(!core.auto_approve_tools);
+
+    let t1 = try core.enqueue_turn(allocator, 1, "manual first", "");
+    testing::expect_equal<i64>(1, t1);
+    testing::expect_equal<i64>(1, try core.begin_next_queued_turn(allocator, 1));
+    testing::expect(try core.request_tool_approval(allocator, 1, "shell", "pwd"));
+    if core.threads.at(0) |thread| {
+        testing::expect(thread.machine_state == TurnMachineState::AwaitingApprovalEmpty);
+    }
+    testing::expect(try core.set_auto_approve_tools(allocator, true));
+    testing::expect(core.auto_approve_tools);
+    if core.threads.at(0) |thread| {
+        testing::expect(thread.machine_state == TurnMachineState::RunningEmpty);
+        testing::expect(!thread.pending_approval.active);
+    }
+    testing::expect(try core.finish_active_turn(allocator, 1, "ok"));
+
+    let script =
+        \\import json, sys
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}}), flush=True)
+        \\    elif method == "session/new":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":"ses-auto"}}), flush=True)
+        \\    elif method == "session/prompt":
+        \\        pid = msg["id"]
+        \\        print(json.dumps({"jsonrpc":"2.0","id":55,"method":"session/request_permission","params":{"toolCall":{"kind":"shell","title":"echo auto"},"options":[{"optionId":"opt-allow","kind":"allow_once"}]}}), flush=True)
+        \\        reply = json.loads(sys.stdin.readline())
+        \\        selected = reply.get("result", {}).get("outcome", {}).get("optionId", "")
+        \\        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses-auto","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"approved:" + selected}}}}), flush=True)
+        \\        print(json.dumps({"jsonrpc":"2.0","id":pid,"result":{"stopReason":"end_turn"}}), flush=True)
+    ;
+    var ov_args = string::new(allocator);
+    defer ov_args.deinit(allocator);
+    try ov_args.append_bytes(allocator, "-u");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, "-c");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, script);
+    let ov_bytes = ov_args.as_bytes();
+
+    try core.set_provider_command_override(
+        allocator,
+        provider::ProviderKind::AntigravityAcp,
+        "/usr/bin/python3",
+        ov_bytes
+    );
+    let th2 = try core.create_thread(
+        allocator,
+        1,
+        "Auto Approve",
+        provider::ProviderKind::AntigravityAcp,
+        "default",
+        provider::ReasoningEffort::Medium
+    );
+    let _ = try core.send_message(allocator, th2, "run shell", "");
+
+    var done = false;
+    for 0..160 |_| {
+        let _ = try core.poll_providers(allocator);
+        if core.threads.at(1) |thread| {
+            if thread.machine_state == TurnMachineState::IdleEmpty and thread.messages.len() == 2 {
+                if thread.messages.at(1) |assistant_msg| {
+                    let a_bytes = assistant_msg.text.as_bytes();
+                    testing::expect(contains_bytes(a_bytes, "approved:opt-allow"));
+                    done = true;
+                    break;
+                }
+            }
+        }
+        let _ = unsafe usleep(5000);
+    }
+    testing::expect(done);
+
+    var snap = string::new(allocator);
+    defer snap.deinit(allocator);
+    try core.snapshot_json(allocator, &var snap);
+    let snap_bytes = snap.as_bytes();
+    testing::expect(contains_bytes(snap_bytes,
+        \\"auto_approve_tools":true
+    ));
+}
+
+test "antigravity ACP send_message steers active turn immediately without queueing" {
+    let allocator = mem::page_allocator();
+    var core = try new_core(allocator, "Kasugai", "/tmp");
+    defer core.deinit(allocator);
+
+    let script =
+        \\import json, sys
+        \\first_id = None
+        \\for raw in sys.stdin:
+        \\    msg = json.loads(raw)
+        \\    method = msg.get("method")
+        \\    if method == "initialize":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":1}}), flush=True)
+        \\    elif method == "session/new":
+        \\        print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"sessionId":"ses-steer"}}), flush=True)
+        \\    elif method == "session/prompt":
+        \\        text = msg["params"]["prompt"][0]["text"]
+        \\        if first_id is None:
+        \\            first_id = msg["id"]
+        \\            print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses-steer","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"part1:" + text}}}}), flush=True)
+        \\        else:
+        \\            print(json.dumps({"jsonrpc":"2.0","id":first_id,"result":{"stopReason":"end_turn"}}), flush=True)
+        \\            print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses-steer","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"part2:" + text}}}}), flush=True)
+        \\            print(json.dumps({"jsonrpc":"2.0","id":msg["id"],"result":{"stopReason":"end_turn"}}), flush=True)
+    ;
+    var ov_args = string::new(allocator);
+    defer ov_args.deinit(allocator);
+    try ov_args.append_bytes(allocator, "-u");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, "-c");
+    try ov_args.append_byte(allocator, 31);
+    try ov_args.append_bytes(allocator, script);
+    let ov_bytes = ov_args.as_bytes();
+
+    try core.set_provider_command_override(
+        allocator,
+        provider::ProviderKind::AntigravityAcp,
+        "/usr/bin/python3",
+        ov_bytes
+    );
+    let th2 = try core.create_thread(
+        allocator,
+        1,
+        "Steer Test",
+        provider::ProviderKind::AntigravityAcp,
+        "default",
+        provider::ReasoningEffort::Medium
+    );
+    let _ = try core.send_message(allocator, th2, "first", "");
+
+    var got_part1 = false;
+    for 0..160 |_| {
+        let _ = try core.poll_providers(allocator);
+        if core.threads.at(1) |thread| {
+            let s_bytes = thread.streaming_text.as_bytes();
+            if contains_bytes(s_bytes, "part1:first") {
+                got_part1 = true;
+                break;
+            }
+        }
+        let _ = unsafe usleep(5000);
+    }
+    testing::expect(got_part1);
+
+    let steered_id = try core.send_message(allocator, th2, "second", "");
+    testing::expect(steered_id > 0);
+    if core.threads.at(1) |thread| {
+        testing::expect_equal<i64>(0, thread.queue.len());
+        testing::expect_equal<i64>(3, thread.messages.len());
+    }
+
+    var done = false;
+    for 0..160 |_| {
+        let _ = try core.poll_providers(allocator);
+        if core.threads.at(1) |thread| {
+            if thread.machine_state == TurnMachineState::IdleEmpty and thread.messages.len() == 4 {
+                if thread.messages.at(3) |last_msg| {
+                    let b = last_msg.text.as_bytes();
+                    testing::expect(contains_bytes(b, "part2:second"));
+                    done = true;
+                    break;
+                }
+            }
+        }
+        let _ = unsafe usleep(5000);
+    }
+    testing::expect(done);
+}

@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "tools": {
+    "kizu": {
+      "version": "0.8.0",
+      "targets": {
+        "darwin-aarch64": {
+          "url": "https://github.com/kizu-lang/kizu/releases/download/v0.8.0/kizu-v0.8.0-darwin-arm64.tar.gz",
+          "sha256": "e0e05678783fd25d3276611857b2e2eb346f3ce5715758447ca26cb33c7e9c74"
+        }
+      }
+    },
+    "ripgrep": {
+      "version": "15.2.0",
+      "targets": {
+        "darwin-aarch64": {
+          "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-aarch64-apple-darwin.tar.gz",
+          "sha256": "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4"
+        }
+      }
+    },
+    "shellcheck": {
+      "version": "0.10.0",
+      "targets": {
+        "darwin-aarch64": {
+          "url": "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.darwin.aarch64.tar.xz",
+          "sha256": "bbd2f14826328eee7679da7221f2bc3afb011f6a928b848c80c321f6046ddf81"
+        }
+      }
+    },
+    "shfmt": {
+      "version": "3.12.0",
+      "targets": {
+        "darwin-aarch64": {
+          "url": "https://github.com/mvdan/sh/releases/download/v3.12.0/shfmt_v3.12.0_darwin_arm64",
+          "sha256": "d903802e0ce3ecbc82b98512f55ba370b0d37a93f3f78de394f5b657052b33dd"
+        }
+      }
+    },
+    "typos": {
+      "version": "1.34.0",
+      "targets": {
+        "darwin-aarch64": {
+          "url": "https://github.com/crate-ci/typos/releases/download/v1.34.0/typos-v1.34.0-aarch64-apple-darwin.tar.gz",
+          "sha256": "7df419f677dc5f3bbfb434e39632c468cdabee599b120e74205ad9a40217a75a"
+        }
+      }
+    },
+    "zig": {
+      "version": "0.15.2",
+      "targets": {
+        "darwin-aarch64": {
+          "url": "https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz",
+          "sha256": "3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b"
+        }
+      }
+    }
+  },
+  "assets": {
+    "tlaplus": {
+      "version": "1.8.0",
+      "targets": {
+        "darwin-aarch64": {
+          "url": "https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar",
+          "sha256": "fdffef247f563ef6edbfd44958d2a82db79e7564e07cb673262d896353fa6713"
+        }
+      }
+    }
+  }
+}

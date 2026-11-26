@@ -1,0 +1,129 @@
+import kasugai::term;
+import std::mem;
+import std::string;
+
+export "c" fn kasugai_term_create_command(
+    cwd: ?ptr<const u8>,
+    command: ?ptr<const u8>,
+    cols: u16,
+    rows: u16
+) -> ?ptr<term::TerminalRuntime> {
+    let allocator = mem::page_allocator();
+    var owned_cwd = string::new(allocator);
+    defer owned_cwd.deinit(allocator);
+    if cwd |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if owned_cwd.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return null;
+        }
+    }
+    var owned_cmd = string::new(allocator);
+    defer owned_cmd.deinit(allocator);
+    if command |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if owned_cmd.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return null;
+        }
+    }
+    let cwd_bytes = owned_cwd.as_bytes();
+    let cmd_bytes = owned_cmd.as_bytes();
+    if term::spawn_terminal_command(allocator, cwd_bytes, cmd_bytes, cols, rows) |runtime| {
+        let storage = unsafe malloc(mem::size_of<term::TerminalRuntime>());
+        if storage |slot| {
+            let handle = unsafe cast<ptr<term::TerminalRuntime>>(slot);
+            unsafe ptr_write(handle, move runtime);
+            return handle;
+        }
+        runtime.deinit(allocator);
+    } else |_| {}
+    return null;
+}
+
+export "c" fn kasugai_term_create(
+    cwd: ?ptr<const u8>,
+    cols: u16,
+    rows: u16
+) -> ?ptr<term::TerminalRuntime> {
+    return kasugai_term_create_command(cwd, null, cols, rows);
+}
+
+export "c" fn kasugai_term_destroy(handle: ?ptr<term::TerminalRuntime>) -> void {
+    if handle |live| {
+        let value = unsafe ptr_read(live);
+        value.deinit(mem::page_allocator());
+        unsafe free(cast<ptr<u8>>(live));
+    }
+    return;
+}
+
+export "c" fn kasugai_term_wakeup_fd(handle: ?ptr<term::TerminalRuntime>) -> i32 {
+    let live = handle orelse return -1;
+    let runtime = unsafe &live.*;
+    return runtime.wakeup_fd();
+}
+
+export "c" fn kasugai_term_drain(handle: ?ptr<term::TerminalRuntime>) -> u8 {
+    let live = handle orelse return 0;
+    let runtime = unsafe &var live.*;
+    if runtime.drain(mem::page_allocator()) |changed| {
+        return flag(changed);
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_term_write(
+    handle: ?ptr<term::TerminalRuntime>,
+    data: ?ptr<const u8>,
+    length: usize
+) -> u8 {
+    let live = handle orelse return 0;
+    let raw = data orelse return 0;
+    if length == 0 {
+        return 1;
+    }
+    let bytes = unsafe view_from_ptr(raw, cast<i64>(length));
+    let runtime = unsafe &var live.*;
+    return flag(runtime.write_input(bytes));
+}
+
+export "c" fn kasugai_term_resize(
+    handle: ?ptr<term::TerminalRuntime>,
+    cols: u16,
+    rows: u16
+) -> u8 {
+    let live = handle orelse return 0;
+    let runtime = unsafe &var live.*;
+    return flag(runtime.resize(cols, rows));
+}
+
+export "c" fn kasugai_term_scroll(handle: ?ptr<term::TerminalRuntime>, delta_lines: i64) -> u8 {
+    let live = handle orelse return 0;
+    let runtime = unsafe &var live.*;
+    runtime.scroll(delta_lines);
+    return 1;
+}
+
+export "c" fn kasugai_term_exited(handle: ?ptr<term::TerminalRuntime>) -> u8 {
+    let live = handle orelse return 1;
+    let runtime = unsafe &var live.*;
+    return flag(runtime.exited());
+}
+
+export "c" fn kasugai_term_snapshot_json(handle: ?ptr<term::TerminalRuntime>) -> ?ptr<u8> {
+    let live = handle orelse return null;
+    let allocator = mem::page_allocator();
+    let runtime = unsafe &var live.*;
+    var out = string::new(allocator);
+    defer out.deinit(allocator);
+    if runtime.snapshot_json(allocator, &var out) {
+        let bytes = out.as_bytes();
+        return c_string_out(bytes);
+    } else |_| {}
+    return null;
+}

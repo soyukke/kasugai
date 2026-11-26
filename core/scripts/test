@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+kizu="${KIZU:-kizu}"
+cd "$root"
+
+"$root/scripts/build-ghostty"
+for package in . host; do
+  echo "== kizu test $package"
+  "$kizu" test "$package"
+done

@@ -1,0 +1,79 @@
+import kasugai::engine;
+import kasugai::provider;
+import std::machine;
+import std::mem;
+import std::string;
+
+fn turn_next(state: engine::TurnMachineState, event: engine::TurnMachineEvent) -> engine::TurnMachineState {
+    return engine::thread_turn_advance(state, event).state;
+}
+
+fn turn_outcome(state: engine::TurnMachineState, event: engine::TurnMachineEvent) -> engine::TurnMachineOutcome {
+    return engine::thread_turn_advance(state, event).outcome;
+}
+
+fn turn_never_ends(state: engine::TurnMachineState) -> bool {
+    let _ = state;
+    return false;
+}
+
+fn session_next(
+    state: provider::ProviderSessionState,
+    event: provider::ProviderSessionEvent
+) -> provider::ProviderSessionState {
+    return provider::provider_session_advance(state, event).state;
+}
+
+fn session_outcome(
+    state: provider::ProviderSessionState,
+    event: provider::ProviderSessionEvent
+) -> provider::ProviderSessionOutcome {
+    return provider::provider_session_advance(state, event).outcome;
+}
+
+fn session_never_ends(state: provider::ProviderSessionState) -> bool {
+    let _ = state;
+    return false;
+}
+
+fn write_table(allocator: Allocator, table: &machine::Table) -> mem::Error!void {
+    var out = string::new(allocator);
+    defer out.deinit(allocator);
+    try table.to_json(allocator, &var out);
+    try out.append_byte(allocator, 10);
+    let text = out.as_bytes();
+    print(text);
+    return;
+}
+
+fn main() -> mem::Error!void {
+    let allocator = mem::page_allocator();
+    let thread_turn = try machine::answers<
+        engine::TurnMachineState,
+        engine::TurnMachineEvent,
+        engine::TurnMachineOutcome
+    >(
+        allocator,
+        turn_next,
+        turn_outcome,
+        engine::TurnMachineState::IdleEmpty,
+        turn_never_ends
+    );
+    defer thread_turn.deinit(allocator);
+    try write_table(allocator, &thread_turn);
+
+    let provider_session = try machine::answers<
+        provider::ProviderSessionState,
+        provider::ProviderSessionEvent,
+        provider::ProviderSessionOutcome
+    >(
+        allocator,
+        session_next,
+        session_outcome,
+        provider::ProviderSessionState::Disconnected,
+        session_never_ends
+    );
+    defer provider_session.deinit(allocator);
+    try write_table(allocator, &provider_session);
+    return;
+}

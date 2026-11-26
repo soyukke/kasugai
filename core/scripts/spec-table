@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+kizu="${KIZU:-kizu}"
+
+check_flag=()
+if [[ "${1:-}" == "--check" || "${1:-}" == "-check" ]]; then
+  check_flag=(-check)
+fi
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/kasugai-spec-table.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
+(cd "$repo_root/core/spec" && "$kizu" run .) >"$work/tables.json"
+"$repo_root/scripts/swift-spec-dump" >>"$work/tables.json"
+
+python3 "$repo_root/scripts/machine-tla" \
+  ${check_flag[@]+"${check_flag[@]}"} \
+  "$repo_root/core/spec/thread_turn.tla" \
+  "$repo_root/core/spec/provider_session.tla" \
+  "$repo_root/core/spec/webview_sync.tla" \
+  "$repo_root/core/spec/sync_loop.tla" \
+  "$repo_root/core/spec/mobile_bridge.tla" \
+  "$repo_root/core/spec/factory_run.tla" \
+  <"$work/tables.json"
+
+echo "spec tables: ok"

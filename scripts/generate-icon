@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+out_icns="${1:-$repo_root/app/Resources/AppIcon.icns}"
+mkdir -p "$(dirname "$out_icns")"
+
+swift_bin="$(env -u SDKROOT -u DEVELOPER_DIR /usr/bin/xcrun --find swift)"
+env -u SDKROOT -u DEVELOPER_DIR "$swift_bin" - "$out_icns" <<'SWIFT'
+import AppKit
+import CoreGraphics
+import Foundation
+import ImageIO
+
+let outIcnsPath = CommandLine.arguments[1]
+let specs: [(String, Int, Bool)] = [
+    ("icp4", 16, false),
+    ("ic11", 32, false),
+    ("icp5", 32, false),
+    ("ic12", 64, false),
+    ("ic07", 128, false),
+    ("ic13", 256, true),
+    ("ic08", 256, true),
+    ("ic14", 512, true),
+    ("ic09", 512, true),
+    ("ic10", 1024, true),
+]
+
+func drawIcon(pixelSize: Int) -> Data {
+    let size = CGFloat(pixelSize)
+    guard
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelSize,
+            pixelsHigh: pixelSize,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ),
+        let ctx = NSGraphicsContext(bitmapImageRep: rep)?.cgContext
+    else {
+        fatalError("bitmap context creation failed")
+    }
+
+    ctx.setAllowsAntialiasing(true)
+    ctx.setShouldAntialias(true)
+
+    let inset = size * 0.08
+    let cardRect = CGRect(x: inset, y: inset, width: size - inset * 2, height: size - inset * 2)
+    let corner = cardRect.width * 0.225
+    let cardPath = CGPath(roundedRect: cardRect, cornerWidth: corner, cornerHeight: corner, transform: nil)
+
+    ctx.saveGState()
+    ctx.addPath(cardPath)
+    ctx.clip()
+
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bgColors = [
+        CGColor(red: 0.14, green: 0.20, blue: 0.34, alpha: 1.0),
+        CGColor(red: 0.08, green: 0.12, blue: 0.21, alpha: 1.0),
+        CGColor(red: 0.05, green: 0.07, blue: 0.13, alpha: 1.0),
+    ] as CFArray
+    if let bgGrad = CGGradient(colorsSpace: colorSpace, colors: bgColors, locations: [0.0, 0.55, 1.0]) {
+        ctx.drawLinearGradient(
+            bgGrad,
+            start: CGPoint(x: cardRect.midX, y: cardRect.maxY),
+            end: CGPoint(x: cardRect.midX, y: cardRect.minY),
+            options: []
+        )
+    }
+
+    let glowColors = [
+        CGColor(red: 0.22, green: 0.62, blue: 0.88, alpha: 0.28),
+        CGColor(red: 0.22, green: 0.62, blue: 0.88, alpha: 0.0),
+    ] as CFArray
+    if let glow = CGGradient(colorsSpace: colorSpace, colors: glowColors, locations: [0.0, 1.0]) {
+        ctx.drawRadialGradient(
+            glow,
+            startCenter: CGPoint(x: size * 0.5, y: size * 0.64),
+            startRadius: 0,
+            endCenter: CGPoint(x: size * 0.5, y: size * 0.64),
+            endRadius: size * 0.45,
+            options: []
+        )
+    }
+    ctx.restoreGState()
+
+    ctx.saveGState()
+    ctx.addPath(cardPath)
+    ctx.setStrokeColor(CGColor(red: 0.52, green: 0.72, blue: 0.94, alpha: 0.32))
+    ctx.setLineWidth(max(1.0, size * 0.014))
+    ctx.strokePath()
+    ctx.restoreGState()
+
+    let barY = size * 0.61
+    let leftX = size * 0.29
+    let rightX = size * 0.71
+    let footY = size * 0.31
+    let strokeW = size * 0.092
+
+    let clampPath = CGMutablePath()
+    clampPath.move(to: CGPoint(x: leftX, y: footY))
+    clampPath.addLine(to: CGPoint(x: leftX, y: barY))
+    clampPath.addLine(to: CGPoint(x: rightX, y: barY))
+    clampPath.addLine(to: CGPoint(x: rightX, y: footY))
+
+    ctx.saveGState()
+    ctx.setShadow(
+        offset: CGSize(width: 0, height: -size * 0.025),
+        blur: size * 0.06,
+        color: CGColor(red: 0.0, green: 0.0, blue: 0.0, alpha: 0.55)
+    )
+    ctx.addPath(clampPath)
+    ctx.setLineWidth(strokeW)
+    ctx.setLineCap(.round)
+    ctx.setLineJoin(.round)
+    ctx.replacePathWithStrokedPath()
+    ctx.clip()
+
+    let metalColors = [
+        CGColor(red: 0.95, green: 0.98, blue: 1.0, alpha: 1.0),
+        CGColor(red: 0.67, green: 0.83, blue: 0.96, alpha: 1.0),
+        CGColor(red: 0.38, green: 0.64, blue: 0.88, alpha: 1.0),
+    ] as CFArray
+    if let metalGrad = CGGradient(colorsSpace: colorSpace, colors: metalColors, locations: [0.0, 0.52, 1.0]) {
+        ctx.drawLinearGradient(
+            metalGrad,
+            start: CGPoint(x: size * 0.5, y: barY + strokeW * 0.6),
+            end: CGPoint(x: size * 0.5, y: footY - strokeW * 0.6),
+            options: []
+        )
+    }
+    ctx.restoreGState()
+
+    let nodeRadius = size * 0.066
+    let nodes: [(CGPoint, CGColor)] = [
+        (CGPoint(x: leftX, y: footY), CGColor(red: 0.34, green: 0.86, blue: 0.72, alpha: 1.0)),
+        (CGPoint(x: rightX, y: footY), CGColor(red: 0.98, green: 0.72, blue: 0.30, alpha: 1.0)),
+    ]
+    for (center, fill) in nodes {
+        let dotRect = CGRect(
+            x: center.x - nodeRadius,
+            y: center.y - nodeRadius,
+            width: nodeRadius * 2,
+            height: nodeRadius * 2
+        )
+        ctx.saveGState()
+        ctx.setFillColor(fill)
+        ctx.fillEllipse(in: dotRect)
+        ctx.setStrokeColor(CGColor(red: 0.07, green: 0.11, blue: 0.19, alpha: 0.85))
+        ctx.setLineWidth(max(1.0, size * 0.016))
+        ctx.strokeEllipse(in: dotRect)
+        ctx.restoreGState()
+    }
+
+    guard let png = rep.representation(using: .png, properties: [:]) else {
+        fatalError("PNG encoding failed")
+    }
+    return png
+}
+
+func encodeIconChunk(pngData: Data, preferJP2: Bool) -> Data {
+    guard preferJP2,
+        let src = CGImageSourceCreateWithData(pngData as CFData, nil),
+        let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil)
+    else {
+        return pngData
+    }
+    let out = NSMutableData()
+    guard let dest = CGImageDestinationCreateWithData(out, "public.jpeg-2000" as CFString, 1, nil)
+    else {
+        return pngData
+    }
+    CGImageDestinationAddImage(
+        dest,
+        cgImage,
+        [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary
+    )
+    if CGImageDestinationFinalize(dest), out.length < pngData.count {
+        return out as Data
+    }
+    return pngData
+}
+
+var body = Data()
+for (fourcc, px, preferJP2) in specs {
+    let png = drawIcon(pixelSize: px)
+    let payload = encodeIconChunk(pngData: png, preferJP2: preferJP2)
+    var chunkLen = UInt32(payload.count + 8).bigEndian
+    body.append(Data(fourcc.utf8))
+    body.append(Data(bytes: &chunkLen, count: 4))
+    body.append(payload)
+}
+var icns = Data("icns".utf8)
+var totalLen = UInt32(body.count + 8).bigEndian
+icns.append(Data(bytes: &totalLen, count: 4))
+icns.append(body)
+try icns.write(to: URL(fileURLWithPath: outIcnsPath))
+SWIFT
+
+printf '%s\n' "$out_icns"

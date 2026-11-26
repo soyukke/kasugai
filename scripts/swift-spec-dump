@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+minimum_macos="14.0"
+host_arch="$(uname -m)"
+if [[ "$host_arch" != "arm64" ]]; then
+  echo "unsupported macOS architecture: $host_arch (Apple Silicon is required)" >&2
+  exit 64
+fi
+
+sdk="$(env -u SDKROOT -u DEVELOPER_DIR /usr/bin/xcrun --sdk macosx --show-sdk-path)"
+swiftc_bin="$(env -u SDKROOT -u DEVELOPER_DIR /usr/bin/xcrun --find swiftc)"
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/kasugai-swift-spec.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
+env -u SDKROOT -u DEVELOPER_DIR "$swiftc_bin" \
+  -parse-as-library \
+  -warnings-as-errors \
+  -sdk "$sdk" \
+  -target "$host_arch-apple-macos$minimum_macos" \
+  "$repo_root/app/Sources/StateMachineTable.swift" \
+  "$repo_root/app/Sources/WebViewSyncMachine.swift" \
+  "$repo_root/app/Sources/SyncLoopMachine.swift" \
+  "$repo_root/app/Sources/MobileBridgeMachine.swift" \
+  "$repo_root/app/Sources/FactoryRunMachine.swift" \
+  "$repo_root/app/SpecExport/main.swift" \
+  -o "$work/kasugai-spec-export"
+
+"$work/kasugai-spec-export"

@@ -1,0 +1,74 @@
+import std::mem;
+import std::string;
+import std::testing;
+
+fn contains_bytes(haystack: []u8, needle: []u8) -> bool {
+    let h_len = mem::len(haystack);
+    let n_len = mem::len(needle);
+    if n_len == 0 {
+        return true;
+    }
+    if n_len > h_len {
+        return false;
+    }
+    var i: i64 = 0;
+    while i <= h_len - n_len {
+        if mem::equal_bytes(haystack[i..i + n_len], needle) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+test "embedded terminal runtime runs command on PTY and renders through libghostty-vt" {
+    let allocator = mem::page_allocator();
+    var term = try spawn_terminal_command(allocator, "/tmp", "printf 'kasugai-term-ok\\n'", 80, 12);
+    defer term.deinit(allocator);
+    testing::expect(term.wakeup_fd() >= 0);
+
+    var snap = string::new(allocator);
+    defer snap.deinit(allocator);
+    var saw_text = false;
+    for 0..100 |_| {
+        let _ = try term.drain(allocator);
+        snap.clear();
+        try term.snapshot_json(allocator, &var snap);
+        let bytes = snap.as_bytes();
+        if contains_bytes(bytes, "kasugai-term-ok") {
+            saw_text = true;
+            break;
+        }
+        let _ = unsafe usleep(5000);
+    }
+    testing::expect(saw_text);
+    testing::expect(term.resize(100, 20));
+}
+
+test "embedded terminal strips agent turn env vars from PTY" {
+    let allocator = mem::page_allocator();
+    var term = try spawn_terminal_command(
+        allocator,
+        "/tmp",
+        "printf 'tid=[%s]\\n' ${KASUGAI_THREAD_ID:-none}",
+        80,
+        12
+    );
+    defer term.deinit(allocator);
+
+    var snap = string::new(allocator);
+    defer snap.deinit(allocator);
+    var saw_empty_tid = false;
+    for 0..100 |_| {
+        let _ = try term.drain(allocator);
+        snap.clear();
+        try term.snapshot_json(allocator, &var snap);
+        let bytes = snap.as_bytes();
+        if contains_bytes(bytes, "tid=[none]") {
+            saw_empty_tid = true;
+            break;
+        }
+        let _ = unsafe usleep(5000);
+    }
+    testing::expect(saw_empty_tid);
+}

@@ -1,0 +1,43 @@
+import std::mem;
+import std::string;
+
+extern "c" fn malloc(size: usize) -> ?ptr<u8>
+extern "c" fn free(p: ptr<u8>) -> void
+extern "c" fn strlen(s: ptr<const u8>) -> usize
+fn flag(value: bool) -> u8 {
+    if value {
+        return 1;
+    }
+    return 0;
+}
+
+fn c_string(allocator: Allocator, text: ptr<const u8>) -> mem::Error!string::String {
+    let length = unsafe strlen(text);
+    let bytes = unsafe view_from_ptr(text, cast<i64>(length));
+    return string::from_bytes(allocator, bytes);
+}
+
+fn c_string_out(bytes: []u8) -> ?ptr<u8> {
+    let length = mem::len(bytes);
+    for 0..length |index| {
+        if bytes[index] == cast<u8>(0) {
+            return null;
+        }
+    }
+    let storage = unsafe malloc(cast<usize>(length + 1));
+    if storage |out| {
+        let view = unsafe mut_view_from_ptr(out, length + 1);
+        for 0..length |index| {
+            view[index] = bytes[index];
+        }
+        view[length] = cast<u8>(0);
+    }
+    return storage;
+}
+
+export "c" fn kasugai_string_free(text: ?ptr<u8>) -> void {
+    if text |live| {
+        unsafe free(live);
+    }
+    return;
+}

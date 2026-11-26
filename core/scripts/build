@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+kizu="${KIZU:-kizu}"
+if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
+  export TMPDIR=/tmp
+fi
+cd "$root"
+
+"$root/scripts/build-ghostty"
+mkdir -p target/host
+(cd host && "$kizu" build --target native --emit obj --opt -o "$root/target/host/kasugai.o" .)

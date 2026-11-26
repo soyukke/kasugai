@@ -1,0 +1,298 @@
+import kasugai::event;
+import std::array;
+import std::mem;
+import std::string;
+
+extern "c" fn open(path: ptr<const u8>, flags: i32, ...) -> i32
+extern "c" fn close(descriptor: i32) -> i32
+extern "c" fn read(descriptor: i32, buffer: ptr<u8>, count: usize) -> isize
+extern "c" fn write(descriptor: i32, bytes: ptr<const u8>, count: usize) -> isize
+extern "c" fn mkdir(path: ptr<const u8>, mode: u16) -> i32
+extern "c" fn clock_gettime(clock: i32, out: &var ClockTime) -> i32
+extern "c" fn malloc(size: usize) -> ?ptr<u8>
+extern "c" fn free(p: ptr<u8>) -> void
+extern "c" struct ClockTime {
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+pub fn unix_millis() -> i64 {
+    var now = ClockTime { seconds: 0, nanoseconds: 0 };
+    let _ = unsafe clock_gettime(0, &var now);
+    return now.seconds * 1000 + now.nanoseconds / 1000000;
+}
+
+fn c_path(allocator: Allocator, path: []u8) -> mem::Error!string::String {
+    var out = try string::from_bytes(allocator, path);
+    errdefer out.deinit(allocator);
+    try out.append_byte(allocator, 0);
+    return move out;
+}
+
+fn parent_length(path: []u8) -> i64 {
+    var index = mem::len(path) - 1;
+    while index > 0 and path[index] != cast<u8>(47) {
+        index = index - 1;
+    }
+    if index == 0 and mem::len(path) > 1 and path[0] == cast<u8>(47) {
+        return 1;
+    }
+    if index < 0 {
+        return 0;
+    }
+    return index;
+}
+
+fn ensure_parent_dirs(allocator: Allocator, directory: []u8) -> mem::Error!void {
+    if mem::len(directory) <= 1 {
+        return;
+    }
+    let parent = parent_length(directory);
+    if parent > 1 {
+        try ensure_parent_dirs(allocator, directory[0..parent]);
+    }
+    let name = try c_path(allocator, directory);
+    defer name.deinit(allocator);
+    let name_bytes = name.as_bytes();
+    let _ = unsafe mkdir(ptr_of(name_bytes), 448);
+    return;
+}
+
+fn write_all(descriptor: i32, bytes: []u8) -> bool {
+    var written: i64 = 0;
+    while written < mem::len(bytes) {
+        let rest = bytes[written..mem::len(bytes)];
+        let count = unsafe write(descriptor, ptr_of(rest), cast<usize>(mem::len(rest)));
+        if count <= 0 {
+            return false;
+        }
+        written = written + cast<i64>(count);
+    }
+    return true;
+}
+
+pub fn append_jsonl_file(allocator: Allocator, path: []u8, line: []u8) -> mem::Error!bool {
+    if mem::len(path) == 0 {
+        return false;
+    }
+    let parent = parent_length(path);
+    if parent > 1 {
+        try ensure_parent_dirs(allocator, path[0..parent]);
+    }
+    var record = try string::from_bytes(allocator, line);
+    defer record.deinit(allocator);
+    try record.append_byte(allocator, 10);
+    let c_target = try c_path(allocator, path);
+    defer c_target.deinit(allocator);
+    let target_bytes = c_target.as_bytes();
+    let descriptor = unsafe open(ptr_of(target_bytes), 521, cast<i32>(384));
+    if descriptor < 0 {
+        return false;
+    }
+    let record_bytes = record.as_bytes();
+    let ok = write_all(descriptor, record_bytes);
+    let _ = unsafe close(descriptor);
+    return ok;
+}
+
+fn open_readonly(allocator: Allocator, path: []u8) -> mem::Error!i32 {
+    let c_target = try c_path(allocator, path);
+    defer c_target.deinit(allocator);
+    let target_bytes = c_target.as_bytes();
+    return unsafe open(ptr_of(target_bytes), 0);
+}
+
+pub fn read_file_bytes(allocator: Allocator, path: []u8, out: &var string::String) -> mem::Error!bool {
+    let descriptor = try open_readonly(allocator, path);
+    if descriptor < 0 {
+        return false;
+    }
+    let maybe_buffer = unsafe malloc(4096);
+    if maybe_buffer |buffer| {
+        var failed = false;
+        while true {
+            let count = unsafe read(descriptor, buffer, 4096);
+            if count <= 0 {
+                if count < 0 {
+                    failed = true;
+                }
+                break;
+            }
+            let chunk = unsafe view_from_ptr(cast<ptr<const u8>>(buffer), cast<i64>(count));
+            if out.append_bytes(allocator, chunk) {} else |_| {
+                failed = true;
+                break;
+            }
+        }
+        unsafe free(buffer);
+        let _ = unsafe close(descriptor);
+        return !failed;
+    }
+    let _ = unsafe close(descriptor);
+    return mem::Error::OutOfMemory;
+}
+
+pub struct EventStore {
+    pub events: array::Array<event::UnifiedEvent>,
+    pub next_seq: i64,
+    pub path: string::String,
+}
+
+pub fn (self: EventStore) deinit(allocator: Allocator) -> void {
+    self.events.deinit(allocator);
+    self.path.deinit(allocator);
+}
+
+pub fn new_memory_store(allocator: Allocator) -> EventStore {
+    return EventStore {
+        events: array::new<event::UnifiedEvent>(allocator),
+        next_seq: 1,
+        path: string::new(allocator)
+    };
+}
+
+pub fn new_file_store(allocator: Allocator, path: []u8) -> mem::Error!EventStore {
+    var owned_path = try string::from_bytes(allocator, path);
+    errdefer owned_path.deinit(allocator);
+    return EventStore {
+        events: array::new<event::UnifiedEvent>(allocator),
+        next_seq: 1,
+        path: move owned_path
+    };
+}
+
+pub fn (self: &var EventStore) attach_path(allocator: Allocator, path: []u8) -> mem::Error!void {
+    self.path.clear();
+    if mem::len(path) > 0 {
+        try self.path.append_bytes(allocator, path);
+    }
+    return;
+}
+
+pub fn (self: &var EventStore) append_replayed(
+    allocator: Allocator,
+    item: event::UnifiedEvent
+) -> mem::Error!void {
+    if item.seq >= self.next_seq {
+        self.next_seq = item.seq + 1;
+    }
+    return self.events.append(allocator, move item);
+}
+
+pub fn (self: &var EventStore) record(
+    allocator: Allocator,
+    project_id: i64,
+    thread_id: i64,
+    turn_id: i64,
+    kind: event::EventKind,
+    provider: []u8,
+    model: []u8,
+    effort: []u8,
+    text: []u8,
+    detail: []u8
+) -> mem::Error!i64 {
+    let seq = self.next_seq;
+    self.next_seq = self.next_seq + 1;
+    let item = try event::new_event(
+        allocator,
+        seq,
+        unix_millis(),
+        project_id,
+        thread_id,
+        turn_id,
+        kind,
+        provider,
+        model,
+        effort,
+        text,
+        detail
+    );
+    if self.path.len() > 0 {
+        var line = string::new(allocator);
+        defer line.deinit(allocator);
+        if event::encode_event_line(allocator, &item, &var line) {
+            let line_bytes = line.as_bytes();
+            let path_bytes = self.path.as_bytes();
+            if append_jsonl_file(allocator, path_bytes, line_bytes) |_| {} else |_| {}
+        } else |_| {}
+    }
+    try self.events.append(allocator, move item);
+    return seq;
+}
+
+pub fn (self: &EventStore) count() -> i64 {
+    return self.events.len();
+}
+
+pub fn (self: &EventStore) export_jsonl(
+    allocator: Allocator,
+    thread_id: i64,
+    out: &var string::String
+) -> mem::Error!void {
+    var index = 0;
+    while self.events.at(index) |item| {
+        if thread_id <= 0 or item.thread_id == thread_id {
+            try event::encode_event_line(allocator, item, out);
+            try out.append_byte(allocator, 10);
+        }
+        index = index + 1;
+    }
+    return;
+}
+
+pub fn parse_jsonl(
+    allocator: Allocator,
+    document: []u8,
+    out: &var array::Array<event::UnifiedEvent>
+) -> event::DecodeEventError!i64 {
+    var loaded: i64 = 0;
+    var start: i64 = 0;
+    let total = mem::len(document);
+    while start < total {
+        var end = start;
+        while end < total and document[end] != cast<u8>(10) {
+            end = end + 1;
+        }
+        var line_end = end;
+        if line_end > start and document[line_end - 1] == cast<u8>(13) {
+            line_end = line_end - 1;
+        }
+        if line_end > start {
+            let line = document[start..line_end];
+            let parsed = try event::decode_event_line(allocator, line);
+            try out.append(allocator, move parsed);
+            loaded = loaded + 1;
+        }
+        start = end + 1;
+    }
+    return loaded;
+}
+
+pub fn parse_jsonl_tolerant(
+    allocator: Allocator,
+    document: []u8,
+    out: &var array::Array<event::UnifiedEvent>
+) -> mem::Error!i64 {
+    var loaded: i64 = 0;
+    var start: i64 = 0;
+    let total = mem::len(document);
+    while start < total {
+        var end = start;
+        while end < total and document[end] != cast<u8>(10) {
+            end = end + 1;
+        }
+        var line_end = end;
+        if line_end > start and document[line_end - 1] == cast<u8>(13) {
+            line_end = line_end - 1;
+        }
+        if line_end > start {
+            let line = document[start..line_end];
+            if event::decode_event_line(allocator, line) |parsed| {
+                try out.append(allocator, move parsed);
+                loaded = loaded + 1;
+            } else |_| {}
+        }
+        start = end + 1;
+    }
+    return loaded;
+}

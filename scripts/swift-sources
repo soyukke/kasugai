@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+
+# shellcheck disable=SC2034
+kasugai_swift_sources=(
+  app/Sources/StateMachineTable.swift
+  app/Sources/WebViewSyncMachine.swift
+  app/Sources/SyncLoopMachine.swift
+  app/Sources/MobileBridgeMachine.swift
+  app/Sources/FactoryRunMachine.swift
+  app/Sources/MobileBridgeProtocol.swift
+  app/Sources/AppSettings.swift
+  app/Sources/KasugaiTheme.swift
+  app/Sources/ProviderModelCatalog.swift
+  app/Sources/RateLimitService.swift
+  app/Sources/KasugaiFFI.swift
+  app/Sources/MobileBridgeServer.swift
+  app/Sources/KasugaiDaemon.swift
+  app/Sources/KasugaiCore.swift
+  app/Sources/KasugaiTerminal.swift
+  app/Sources/GitWorkspace.swift
+  app/Sources/LocalOrchestratorBridge.swift
+  app/Sources/KasugaiViewRenderer.swift
+  app/Sources/LocalPreviewBrowserView.swift
+  app/Sources/LocalBrowserBridge.swift
+  app/Sources/DiffViewerController.swift
+  app/Sources/TerminalPaneViewController.swift
+  app/Sources/SidebarViewController.swift
+  app/Sources/FactoryModels.swift
+  app/Sources/FactoryViewController.swift
+  app/Sources/ComposerView.swift
+  app/Sources/SettingsViewController.swift
+  app/Sources/RateLimitsViewController.swift
+  app/Sources/MainSplitViewController.swift
+  app/Sources/MainMenuController.swift
+  app/Sources/UISnapshotRenderer.swift
+  app/Sources/KasugaiAppDelegate.swift
+  app/Sources/KasugaiMain.swift
+)

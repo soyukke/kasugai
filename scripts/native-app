@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${KUGI_ACTIVE:-}" ]]; then
+  exec kugi exec -- env KUGI_ACTIVE=1 ./scripts/native-app "$@"
+fi
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+./scripts/native-build
+
+if [[ ! -f app/Resources/AppIcon.icns ]]; then
+  ./scripts/generate-icon app/Resources/AppIcon.icns >/dev/null
+fi
+
+version="$(tr -d '[:space:]' <VERSION)"
+build_number="${KASUGAI_BUILD_NUMBER:-$(git rev-list --count HEAD 2>/dev/null || printf '1')}"
+app_path="app/.build/Kasugai.app"
+contents="$app_path/Contents"
+app_binary="$contents/MacOS/Kasugai"
+daemon_binary="$contents/MacOS/kasugaid"
+
+rm -rf -- "$app_path"
+mkdir -p "$contents/MacOS" "$contents/Resources"
+/usr/bin/ditto app/.build/Kasugai "$app_binary"
+chmod 755 "$app_binary"
+ln -s Kasugai "$daemon_binary"
+/usr/bin/ditto app/.build/ViewRenderer "$contents/Resources/ViewRenderer"
+/usr/bin/ditto app/Resources/AppIcon.icns "$contents/Resources/AppIcon.icns"
+printf 'APPL????' >"$contents/PkgInfo"
+
+sed \
+  -e "s/@VERSION@/$version/g" \
+  -e "s/@BUILD_NUMBER@/$build_number/g" \
+  -e "s/@MINIMUM_MACOS@/14.0/g" \
+  -e "s/@DISPLAY_NAME@/Kasugai/g" \
+  -e "s/@EXECUTABLE@/Kasugai/g" \
+  -e "s/@BUNDLE_ID@/dev.soyukke.kasugai/g" \
+  app/Info.plist.in >"$contents/Info.plist"
+
+plutil -lint "$contents/Info.plist" >/dev/null
+/usr/bin/xattr -cr "$app_path"
+sign_identity="${KASUGAI_CODESIGN_IDENTITY:-}"
+if [[ -z "$sign_identity" ]]; then
+  sign_identity="$(
+    /usr/bin/security find-identity -v -p codesigning 2>/dev/null |
+      awk -F'"' '/Apple Development:/ { print $2; exit }' || true
+  )"
+fi
+if [[ -z "$sign_identity" ]]; then
+  sign_identity="-"
+fi
+if ! /usr/bin/codesign --force --deep --sign "$sign_identity" --entitlements app/Kasugai.entitlements "$app_path" >/dev/null 2>&1; then
+  if [[ "$sign_identity" != "-" && -z "${KASUGAI_CODESIGN_IDENTITY:-}" ]]; then
+    /usr/bin/codesign --force --deep --sign - --entitlements app/Kasugai.entitlements "$app_path" >/dev/null
+  else
+    exit 1
+  fi
+fi
+/usr/bin/codesign --verify --deep --strict "$app_path"
+
+printf '%s\n' "$app_path"

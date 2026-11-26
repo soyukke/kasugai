@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then
+  export TMPDIR=/tmp
+fi
+
+if [[ -z "${KUGI_ACTIVE:-}" && -z "${KIZU:-}" ]]; then
+  exec kugi exec -- env KUGI_ACTIVE=1 ./scripts/native-build "$@"
+fi
+
+fast_mode=false
+force_mode=false
+for arg in "$@"; do
+  case "$arg" in
+    --fast)
+      fast_mode=true
+      ;;
+    --force)
+      force_mode=true
+      ;;
+    *)
+      echo "unknown option: $arg" >&2
+      exit 64
+      ;;
+  esac
+done
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+# shellcheck source=scripts/swift-sources
+source scripts/swift-sources
+
+build_dir="app/.build"
+jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+if [[ "$fast_mode" == true ]]; then
+  output="$build_dir/Kasugai-dev"
+  tmp_output="$output"
+  cache_dir="$build_dir/dev-cache"
+  opt_level="-Onone"
+else
+  output="$build_dir/Kasugai"
+  tmp_output="$build_dir/Kasugai.$$"
+  cache_dir="$build_dir/release-cache"
+  opt_level="-Osize"
+fi
+if [[ "$force_mode" == true ]]; then
+  rm -rf "$cache_dir"
+elif [[ -d "$cache_dir" && "$(cat "$cache_dir/opt-level" 2>/dev/null || true)" != "$opt_level" ]]; then
+  rm -rf "$cache_dir"
+fi
+mkdir -p "$cache_dir"
+printf '%s\n' "$opt_level" >"$cache_dir/opt-level"
+output_map="$cache_dir/output-file-map.json"
+python3 - "$cache_dir" "$output_map" "${kasugai_swift_sources[@]}" <<'PY'
+import json
+import os
+import sys
+
+cache_dir = os.path.abspath(sys.argv[1])
+output_map = sys.argv[2]
+sources = sys.argv[3:]
+mapping = {
+    "": {
+        "swift-dependencies": os.path.join(cache_dir, "master.swiftdeps"),
+    }
+}
+for src in sources:
+    stem = os.path.splitext(os.path.basename(src))[0]
+    mapping[src] = {
+        "object": os.path.join(cache_dir, f"{stem}.o"),
+        "dependencies": os.path.join(cache_dir, f"{stem}.d"),
+        "swift-dependencies": os.path.join(cache_dir, f"{stem}.swiftdeps"),
+    }
+rendered = json.dumps(mapping, indent=2, sort_keys=True)
+if not os.path.exists(output_map) or open(output_map, encoding="utf-8").read() != rendered:
+    with open(output_map, "w", encoding="utf-8") as fh:
+        fh.write(rendered)
+PY
+swift_opt_flags=("$opt_level" -incremental -j "$jobs" -output-file-map "$output_map" -module-name Kasugai)
+minimum_macos="14.0"
+host_arch="$(uname -m)"
+if [[ "$host_arch" != "arm64" ]]; then
+  echo "unsupported macOS architecture: $host_arch (Apple Silicon is required)" >&2
+  exit 64
+fi
+swift_target="$host_arch-apple-macos$minimum_macos"
+
+mkdir -p "$build_dir"
+cleanup() {
+  if [[ "$tmp_output" != "$output" ]]; then
+    rm -f "$tmp_output"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+sdk="$(env -u SDKROOT -u DEVELOPER_DIR /usr/bin/xcrun --sdk macosx --show-sdk-path)"
+swiftc_bin="$(env -u SDKROOT -u DEVELOPER_DIR /usr/bin/xcrun --find swiftc)"
+
+core_obj="$repo_root/core/target/host/kasugai.o"
+ghostty_lib="$repo_root/core/target/native/libghostty-vt.a"
+need_core_build=true
+if [[ "$force_mode" != true && -f "$core_obj" && -f "$ghostty_lib" ]]; then
+  newer_kizu="$(find "$repo_root/core/src" "$repo_root/core/host/src" "$repo_root/core/build.kizu" "$repo_root/core/host/build.kizu" -name '*.kizu' -newer "$core_obj" -print -quit 2>/dev/null || true)"
+  if [[ -z "$newer_kizu" ]]; then
+    need_core_build=false
+  fi
+fi
+if [[ "$need_core_build" == true ]]; then
+  MACOSX_DEPLOYMENT_TARGET="$minimum_macos" "$repo_root/core/scripts/build"
+fi
+
+rm -rf "$build_dir/ViewRenderer"
+cp -R "$repo_root/view-renderer" "$build_dir/ViewRenderer"
+
+if [[ "$fast_mode" != true ]]; then
+  bin_fp_file="$build_dir/Kasugai.bin.fingerprint"
+  test_fp_file="$build_dir/Kasugai.test.fingerprint"
+  current_bin_fp="$(
+    python3 - "$core_obj" "$ghostty_lib" "$repo_root/scripts/native-build" "${kasugai_swift_sources[@]}" <<'PY'
+import hashlib
+import os
+import sys
+
+h = hashlib.sha256()
+for path in sys.argv[1:]:
+    h.update(path.encode("utf-8"))
+    h.update(b"\0")
+    if os.path.isfile(path):
+        with open(path, "rb") as fh:
+            h.update(fh.read())
+    h.update(b"\0")
+print(h.hexdigest())
+PY
+  )"
+  current_test_fp="$(
+    python3 - "$current_bin_fp" "$repo_root/view-renderer" <<'PY'
+import hashlib
+import os
+import sys
+
+h = hashlib.sha256()
+h.update(sys.argv[1].encode("utf-8"))
+root = sys.argv[2]
+for name in sorted(os.listdir(root)):
+    path = os.path.join(root, name)
+    if os.path.isfile(path):
+        h.update(name.encode("utf-8"))
+        with open(path, "rb") as fh:
+            h.update(fh.read())
+print(h.hexdigest())
+PY
+  )"
+
+  need_swift_build=true
+  if [[ "$force_mode" != true && -x "$output" && -f "$bin_fp_file" ]]; then
+    if [[ "$(cat "$bin_fp_file")" == "$current_bin_fp" ]]; then
+      need_swift_build=false
+    fi
+  fi
+
+  if [[ "$need_swift_build" == true ]]; then
+    env -u SDKROOT -u DEVELOPER_DIR "$swiftc_bin" \
+      "${swift_opt_flags[@]}" \
+      -parse-as-library \
+      -warnings-as-errors \
+      -sdk "$sdk" \
+      -target "$swift_target" \
+      "${kasugai_swift_sources[@]}" \
+      "$core_obj" \
+      "$ghostty_lib" \
+      -Xlinker -dead_strip \
+      -framework AppKit \
+      -framework CoreImage \
+      -framework Foundation \
+      -framework Security \
+      -framework WebKit \
+      -o "$tmp_output"
+    /usr/bin/strip -x "$tmp_output"
+    mv -f "$tmp_output" "$output"
+    printf '%s\n' "$current_bin_fp" >"$bin_fp_file"
+  fi
+
+  need_self_test=true
+  if [[ "$force_mode" != true && "$need_swift_build" != true && -f "$test_fp_file" ]]; then
+    if [[ "$(cat "$test_fp_file")" == "$current_test_fp" ]]; then
+      need_self_test=false
+    fi
+  fi
+  if [[ "$need_self_test" == true ]]; then
+    KASUGAI_SELF_TEST=1 "$output"
+    printf '%s\n' "$current_test_fp" >"$test_fp_file"
+  fi
+  exit 0
+fi
+
+env -u SDKROOT -u DEVELOPER_DIR "$swiftc_bin" \
+  "${swift_opt_flags[@]}" \
+  -parse-as-library \
+  -warnings-as-errors \
+  -sdk "$sdk" \
+  -target "$swift_target" \
+  "${kasugai_swift_sources[@]}" \
+  "$core_obj" \
+  "$ghostty_lib" \
+  -framework AppKit \
+  -framework CoreImage \
+  -framework Foundation \
+  -framework Security \
+  -framework WebKit \
+  -o "$tmp_output"
+
+if [[ "$tmp_output" != "$output" ]]; then
+  mv -f "$tmp_output" "$output"
+fi

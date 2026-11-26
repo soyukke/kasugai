@@ -1,0 +1,46 @@
+import std::mem;
+import std::string;
+import std::testing;
+
+test "pipe process spawns subprocess, transfers lines, and closes cleanly" {
+    let allocator = mem::page_allocator();
+    var launch = new_process_launch(allocator);
+    defer launch.deinit(allocator);
+    try launch.set_executable(allocator, "/bin/sh");
+    try launch.add_arg(allocator, "-c");
+    let cmd =
+        \\IFS= read -r line; printf '%s:%s\n' "$KASUGAI_TEST_ENV" "$line"
+    ;
+    try launch.add_arg(allocator, cmd);
+    try launch.set_env(allocator, "KASUGAI_TEST_ENV", "ok");
+
+    var proc = try spawn_pipe_process(allocator, &launch);
+    defer proc.deinit(allocator);
+    testing::expect(proc.wakeup_fd() >= 0);
+
+    try proc.write_line(allocator, "hello");
+
+    var reply = string::new(allocator);
+    defer reply.deinit(allocator);
+    var got_line = false;
+    for 0..100 |_| {
+        let _ = try proc.read_available(allocator);
+        if try proc.take_line(allocator, &var reply) {
+            got_line = true;
+            break;
+        }
+        let _ = unsafe usleep(5000);
+    }
+    testing::expect(got_line);
+    let reply_bytes = reply.as_bytes();
+    testing::expect(mem::equal_bytes(reply_bytes, "ok:hello"));
+}
+
+test "resolve executable in path finds binaries across colon-separated directories" {
+    let allocator = mem::page_allocator();
+    var resolved = string::new(allocator);
+    defer resolved.deinit(allocator);
+    testing::expect(try resolve_executable_in_path(allocator, "sh", "/nonexistent:/bin", &var resolved));
+    let bytes = resolved.as_bytes();
+    testing::expect(mem::equal_bytes(bytes, "/bin/sh"));
+}

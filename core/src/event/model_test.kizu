@@ -1,0 +1,53 @@
+import std::mem;
+import std::string;
+import std::testing;
+
+test "unified event round-trips through JSON line" {
+    let allocator = mem::page_allocator();
+    let item = try new_event(
+        allocator,
+        7,
+        1700000000123,
+        1,
+        2,
+        3,
+        EventKind::MessageDelta,
+        "opencode_acp",
+        "gpt-5",
+        "high",
+        "hello",
+        "chunk-1"
+    );
+    defer item.deinit(allocator);
+
+    var encoded = string::new(allocator);
+    defer encoded.deinit(allocator);
+    try encode_event_line(allocator, &item, &var encoded);
+    let encoded_bytes = encoded.as_bytes();
+    let want =
+        \\{"seq":7,"timestamp_ms":1700000000123,"project_id":1,"thread_id":2,"turn_id":3,"kind":"message.delta","provider":"opencode_acp","model":"gpt-5","effort":"high","text":"hello","detail":"chunk-1"}
+    ;
+    if !mem::equal_bytes(encoded_bytes, want) {
+        testing::fail(encoded_bytes);
+    }
+
+    let decoded = try decode_event_line(allocator, encoded_bytes);
+    defer decoded.deinit(allocator);
+    testing::expect_equal<i64>(7, decoded.seq);
+    testing::expect_equal<i64>(2, decoded.thread_id);
+    testing::expect_equal<i64>(3, decoded.turn_id);
+    testing::expect(decoded.kind == EventKind::MessageDelta);
+    let decoded_text = decoded.text.as_bytes();
+    testing::expect(mem::equal_bytes(decoded_text, "hello"));
+}
+
+test "unknown event kind is rejected" {
+    let allocator = mem::page_allocator();
+    let bad =
+        \\{"seq":1,"timestamp_ms":0,"project_id":1,"thread_id":1,"turn_id":0,"kind":"not.a.kind"}
+    ;
+    if decode_event_line(allocator, bad) |parsed| {
+        parsed.deinit(allocator);
+        testing::fail("expected decode failure");
+    } else |_| {}
+}

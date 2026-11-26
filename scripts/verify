@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+import concurrent.futures
+import hashlib
+import os
+import subprocess
+import sys
+import time
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SPEC_STAMP_PATH = os.path.join(REPO_ROOT, "app", ".build", "spec-verify.fingerprint")
+
+
+def compute_spec_fingerprint():
+    hasher = hashlib.sha256()
+    paths = [
+        "core/src/engine/turn_machine.kizu",
+        "core/src/provider/session_machine.kizu",
+        "app/Sources/StateMachineTable.swift",
+        "app/Sources/WebViewSyncMachine.swift",
+        "app/Sources/SyncLoopMachine.swift",
+        "app/Sources/MobileBridgeMachine.swift",
+        "app/Sources/FactoryRunMachine.swift",
+        "core/scripts/spec-table",
+        "core/scripts/spec-verify",
+        "scripts/machine-tla",
+        "scripts/swift-spec-dump",
+    ]
+    spec_dir = os.path.join(REPO_ROOT, "core", "spec")
+    for dirpath, _, filenames in os.walk(spec_dir):
+        for name in sorted(filenames):
+            rel = os.path.relpath(os.path.join(dirpath, name), REPO_ROOT)
+            paths.append(rel)
+    for rel in sorted(set(paths)):
+        full = os.path.join(REPO_ROOT, rel)
+        hasher.update(rel.encode("utf-8"))
+        hasher.update(b"\0")
+        if os.path.isfile(full):
+            with open(full, "rb") as fh:
+                hasher.update(fh.read())
+        hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+def run_stage_buffered(name, cmd):
+    started = time.monotonic()
+    result = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    elapsed = time.monotonic() - started
+    return name, result.returncode, result.stdout, result.stderr, elapsed
+
+
+def run_stage(name, cmd):
+    started = time.monotonic()
+    result = subprocess.run(cmd, cwd=REPO_ROOT)
+    elapsed = time.monotonic() - started
+    if result.returncode != 0:
+        sys.stderr.write(f"verify: stage `{name}` failed after {elapsed:.2f}s\n")
+        sys.exit(result.returncode)
+    return elapsed
+
+
+def main():
+    args = sys.argv[1:]
+    include_build = "--with-build" in args
+    force_spec = "--with-spec" in args or os.environ.get("KASUGAI_FORCE_SPEC") == "1"
+    max_seconds = float(os.environ.get("KASUGAI_VERIFY_MAX_SECONDS", "20"))
+    if include_build:
+        max_seconds = float(os.environ.get("KASUGAI_CI_MAX_SECONDS", "30"))
+
+    parallel_stages = [
+        ("fmt-check", ["just", "fmt-check"]),
+        ("kizu-lint", ["just", "kizu-lint"]),
+        ("comment-lint", ["just", "comment-lint"]),
+        ("repo-lint", ["just", "repo-lint"]),
+        ("check", ["just", "check"]),
+        ("test", ["just", "test"]),
+    ]
+
+    timings = []
+    total_started = time.monotonic()
+
+    parallel_started = time.monotonic()
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(parallel_stages)) as pool:
+        futures = [pool.submit(run_stage_buffered, name, cmd) for name, cmd in parallel_stages]
+        for fut in concurrent.futures.as_completed(futures):
+            name, code, stdout, stderr, elapsed = fut.result()
+            results[name] = (code, stdout, stderr, elapsed)
+
+    for name, _ in parallel_stages:
+        code, stdout, stderr, elapsed = results[name]
+        if stdout:
+            sys.stdout.write(stdout)
+        if stderr:
+            sys.stderr.write(stderr)
+        if code != 0:
+            sys.stderr.write(f"verify: stage `{name}` failed after {elapsed:.2f}s\n")
+            return code
+    parallel_elapsed = time.monotonic() - parallel_started
+    timings.append(("lint+test(parallel)", parallel_elapsed))
+
+    spec_fp = compute_spec_fingerprint()
+    saved_fp = ""
+    if os.path.isfile(SPEC_STAMP_PATH):
+        try:
+            with open(SPEC_STAMP_PATH, encoding="utf-8") as fh:
+                saved_fp = fh.read().strip()
+        except OSError:
+            saved_fp = ""
+
+    if force_spec or spec_fp != saved_fp:
+        timings.append(("spec-table-check", run_stage("spec-table-check", ["just", "spec-table-check"])))
+        timings.append(("spec-verify", run_stage("spec-verify", ["just", "spec-verify"])))
+        os.makedirs(os.path.dirname(SPEC_STAMP_PATH), exist_ok=True)
+        with open(SPEC_STAMP_PATH, "w", encoding="utf-8") as fh:
+            fh.write(spec_fp + "\n")
+    else:
+        print("spec verify (TLA+ / TLC): skipped (unchanged; run `just ci-full` before PR merge)")
+        timings.append(("spec(cached)", 0.0))
+
+    if include_build:
+        timings.append(("build", run_stage("build", ["just", "build"])))
+
+    total = time.monotonic() - total_started
+    breakdown = ", ".join(f"{name}={sec:.2f}s" for name, sec in timings)
+    if force_spec:
+        print(f"local-ci timing: total={total:.2f}s / budget=unbounded ({breakdown})")
+        return 0
+    print(f"local-ci timing: total={total:.2f}s / budget={max_seconds:.2f}s ({breakdown})")
+    if total > max_seconds:
+        sys.stderr.write(
+            f"local-ci timing gate failed: {total:.2f}s exceeded budget {max_seconds:.2f}s\n"
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

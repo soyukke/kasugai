@@ -1,0 +1,642 @@
+import std::json;
+import std::mem;
+import std::string;
+
+pub error GhosttyError {
+    Refused,
+}
+
+pub error TermFailure = GhosttyError or mem::Error;
+
+extern "c" fn malloc(size: usize) -> ?ptr<u8>
+extern "c" fn free(p: ptr<u8>) -> void
+extern "c" struct TerminalOptions {
+    cols: u16,
+    rows: u16,
+    max_scrollback: usize,
+}
+
+extern "c" struct GhosttyBuffer {
+    data: ?ptr<u8>,
+    cap: usize,
+    len: usize,
+}
+
+extern "c" struct StyleColor {
+    tag: i32,
+    value: u64,
+}
+
+extern "c" struct GhosttyStyle {
+    size: usize,
+    fg_color: StyleColor,
+    bg_color: StyleColor,
+    underline_color: StyleColor,
+    bold: bool,
+    italic: bool,
+    faint: bool,
+    blink: bool,
+    inverse: bool,
+    invisible: bool,
+    strikethrough: bool,
+    overline: bool,
+    underline: i32,
+}
+
+extern "c" struct TerminalScrollbar {
+    total: u64,
+    offset: u64,
+    len: u64,
+}
+
+extern "c" struct Rgb {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+extern "c" struct ScrollValue {
+    delta: isize,
+    padding: u64,
+}
+
+extern "c" struct ScrollViewport {
+    tag: i32,
+    value: ScrollValue,
+}
+
+@link_library("ghostty-vt")
+extern "c" fn ghostty_terminal_new(
+    allocator: ?ptr<u8>,
+    terminal: ptr<usize>,
+    options: TerminalOptions
+) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_terminal_free(terminal: ptr<u8>) -> void
+@link_library("ghostty-vt")
+extern "c" fn ghostty_terminal_vt_write(terminal: ptr<u8>, data: ptr<const u8>, length: usize) -> void
+@link_library("ghostty-vt")
+extern "c" fn ghostty_terminal_get(terminal: ptr<u8>, data: i32, out: ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_terminal_set(terminal: ptr<u8>, option: i32, value: ?ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_terminal_resize(
+    terminal: ptr<u8>,
+    cols: u16,
+    rows: u16,
+    cell_width: u32,
+    cell_height: u32
+) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_terminal_scroll_viewport(terminal: ptr<u8>, behavior: ScrollViewport) -> void
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_new(allocator: ?ptr<u8>, out: ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_free(state: ptr<u8>) -> void
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_update(state: ptr<u8>, terminal: ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_get(state: ptr<u8>, data: i32, out: ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_set(state: ptr<u8>, option: i32, value: ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_row_iterator_new(allocator: ?ptr<u8>, out: ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_row_iterator_free(iterator: ptr<u8>) -> void
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_row_iterator_next(iterator: ptr<u8>) -> bool
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_row_get(iterator: ptr<u8>, data: i32, out: ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_row_set(iterator: ptr<u8>, option: i32, value: ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_row_cells_new(allocator: ?ptr<u8>, out: ptr<u8>) -> i32
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_row_cells_free(cells: ptr<u8>) -> void
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_row_cells_next(cells: ptr<u8>) -> bool
+@link_library("ghostty-vt")
+extern "c" fn ghostty_render_state_row_cells_get(cells: ptr<u8>, data: i32, out: ptr<u8>) -> i32
+struct TermSink {
+    replies: string::String,
+}
+fn sink_ptr(userdata: ?ptr<u8>) -> ?ptr<TermSink> {
+    let data = userdata orelse return null;
+    return unsafe cast<ptr<TermSink>>(data);
+}
+
+export "c" fn kasugai_term_on_write_pty(
+    terminal: ?ptr<u8>,
+    userdata: ?ptr<u8>,
+    data: ?ptr<const u8>,
+    length: usize
+) -> void {
+    let _ = terminal;
+    let cell = sink_ptr(userdata) orelse return;
+    let bytes = data orelse return;
+    let reply = unsafe view_from_ptr(bytes, cast<i64>(length));
+    let sink = unsafe &var cell.*;
+    if sink.replies.append_bytes(mem::page_allocator(), reply) {} else |_| {}
+    return;
+}
+
+fn slot_size() -> usize {
+    return 128;
+}
+
+fn alloc_slot() -> ?ptr<u8> {
+    let slot = unsafe malloc(slot_size()) orelse return null;
+    zero_slot(slot);
+    return slot;
+}
+
+fn zero_slot(slot: ptr<u8>) -> void {
+    let bytes = unsafe mut_view_from_ptr(slot, cast<i64>(slot_size()));
+    for 0..mem::len(bytes) |index| {
+        bytes[index] = 0;
+    }
+    return;
+}
+
+fn slot_read_bool(slot: ptr<u8>) -> bool {
+    return unsafe ptr_read(slot) != 0;
+}
+
+fn slot_read_u16(slot: ptr<u8>) -> u16 {
+    return unsafe ptr_read(cast<ptr<u16>>(slot));
+}
+
+fn slot_read_i32(slot: ptr<u8>) -> i32 {
+    return unsafe ptr_read(cast<ptr<i32>>(slot));
+}
+
+fn slot_read_usize(slot: ptr<u8>) -> usize {
+    return unsafe ptr_read(cast<ptr<usize>>(slot));
+}
+
+fn slot_write_usize(slot: ptr<u8>, value: usize) -> void {
+    unsafe ptr_write(cast<ptr<usize>>(slot), value);
+    return;
+}
+
+fn slot_read_rgb(slot: ptr<u8>) -> Rgb {
+    return unsafe ptr_read(cast<ptr<Rgb>>(slot));
+}
+
+fn slot_read_handle(slot: ptr<u8>) -> ?ptr<u8> {
+    let address = slot_read_usize(slot);
+    if address == 0 {
+        return null;
+    }
+    return unsafe ptr_from_int<ptr<u8>>(address);
+}
+
+fn slot_write_handle(slot: ptr<u8>, handle: ptr<u8>) -> void {
+    let address = unsafe int_from_ptr<usize>(handle);
+    slot_write_usize(slot, address);
+    return;
+}
+
+fn alloc_render_handle(slot: ptr<u8>, kind: i64) -> ?ptr<u8> {
+    slot_write_usize(slot, 0);
+    var res: i32 = -1;
+    if kind == 0 {
+        res = unsafe ghostty_render_state_new(null, slot);
+    } else if kind == 1 {
+        res = unsafe ghostty_render_state_row_iterator_new(null, slot);
+    } else {
+        res = unsafe ghostty_render_state_row_cells_new(null, slot);
+    }
+    if res != 0 {
+        return null;
+    }
+    return slot_read_handle(slot);
+}
+
+pub unsafe struct GhosttyScreen {
+    terminal: ptr<u8>,
+    sink: ptr<TermSink>,
+    render_state: ptr<u8>,
+    rows_iter: ptr<u8>,
+    cells_iter: ptr<u8>,
+    slot: ptr<u8>,
+    text_buf: ptr<u8>,
+    text_cap: usize,
+}
+
+pub fn new_ghostty_screen(cols: u16, rows: u16, max_scrollback: usize) -> GhosttyError!GhosttyScreen {
+    let slot = alloc_slot() orelse return GhosttyError::Refused;
+    let options = TerminalOptions { cols: cols, rows: rows, max_scrollback: max_scrollback };
+    let term_res = unsafe ghostty_terminal_new(null, cast<ptr<usize>>(slot), options);
+    let term_opt = slot_read_handle(slot);
+    let render_opt = alloc_render_handle(slot, 0);
+    let rows_opt = alloc_render_handle(slot, 1);
+    let cells_opt = alloc_render_handle(slot, 2);
+    let text_opt = unsafe malloc(256);
+    let sink_opt = unsafe malloc(mem::size_of<TermSink>());
+
+    if term_res == 0 {
+        if term_opt |terminal| {
+            if render_opt |render_state| {
+                if rows_opt |rows_iter| {
+                    if cells_opt |cells_iter| {
+                        if text_opt |text_buf| {
+                            if sink_opt |sink_raw| {
+                                let sink = unsafe cast<ptr<TermSink>>(sink_raw);
+                                let empty = TermSink { replies: string::new(mem::page_allocator()) };
+                                unsafe ptr_write(sink, move empty);
+                                let userdata = unsafe cast<ptr<u8>>(sink);
+                                let write_fn = unsafe cast<ptr<u8>>(cast<ptr<const u8>>(kasugai_term_on_write_pty));
+                                let _ = unsafe ghostty_terminal_set(terminal, 0, userdata);
+                                let _ = unsafe ghostty_terminal_set(terminal, 1, write_fn);
+                                return unsafe GhosttyScreen {
+                                    terminal: terminal,
+                                    sink: sink,
+                                    render_state: render_state,
+                                    rows_iter: rows_iter,
+                                    cells_iter: cells_iter,
+                                    slot: slot,
+                                    text_buf: text_buf,
+                                    text_cap: 256
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if sink_opt |raw| {
+        unsafe free(raw);
+    }
+    if text_opt |raw| {
+        unsafe free(raw);
+    }
+    if cells_opt |live| {
+        unsafe ghostty_render_state_row_cells_free(live);
+    }
+    if rows_opt |live| {
+        unsafe ghostty_render_state_row_iterator_free(live);
+    }
+    if render_opt |live| {
+        unsafe ghostty_render_state_free(live);
+    }
+    if term_opt |live| {
+        unsafe ghostty_terminal_free(live);
+    }
+    unsafe free(slot);
+    return GhosttyError::Refused;
+}
+
+pub fn (self: GhosttyScreen) deinit() -> void {
+    unsafe ghostty_render_state_row_cells_free(self.cells_iter);
+    unsafe ghostty_render_state_row_iterator_free(self.rows_iter);
+    unsafe ghostty_render_state_free(self.render_state);
+    unsafe ghostty_terminal_free(self.terminal);
+    let sink = unsafe ptr_read(self.sink);
+    sink.replies.deinit(mem::page_allocator());
+    unsafe free(cast<ptr<u8>>(self.sink));
+    unsafe free(self.text_buf);
+    unsafe free(self.slot);
+}
+
+pub fn (self: &var GhosttyScreen) feed(bytes: []u8) -> void {
+    if mem::len(bytes) == 0 {
+        return;
+    }
+    unsafe ghostty_terminal_vt_write(self.terminal, ptr_of(bytes), cast<usize>(mem::len(bytes)));
+    return;
+}
+
+pub fn (self: &GhosttyScreen) take_replies(
+    allocator: Allocator,
+    out: &var string::String
+) -> mem::Error!void {
+    let cell = self.sink;
+    let sink = unsafe &var cell.*;
+    let bytes = sink.replies.as_bytes();
+    let res = out.append_bytes(allocator, bytes);
+    sink.replies.clear();
+    try res;
+    return;
+}
+
+pub fn (self: &var GhosttyScreen) resize(cols: u16, rows: u16) -> bool {
+    var safe_cols = cols;
+    var safe_rows = rows;
+    if safe_cols < 2 {
+        safe_cols = 2;
+    }
+    if safe_rows < 2 {
+        safe_rows = 2;
+    }
+    let res = unsafe ghostty_terminal_resize(self.terminal, safe_cols, safe_rows, 8, 16);
+    return res == 0;
+}
+
+pub fn (self: &var GhosttyScreen) scroll_delta(rows: i64) -> void {
+    let behavior = ScrollViewport {
+        tag: 2,
+        value: ScrollValue { delta: cast<isize>(rows), padding: 0 }
+    };
+    unsafe ghostty_terminal_scroll_viewport(self.terminal, behavior);
+    return;
+}
+
+pub fn (self: &var GhosttyScreen) scroll_bottom() -> void {
+    let behavior = ScrollViewport {
+        tag: 1,
+        value: ScrollValue { delta: 0, padding: 0 }
+    };
+    unsafe ghostty_terminal_scroll_viewport(self.terminal, behavior);
+    return;
+}
+
+fn hex_nibble(v: u8) -> u8 {
+    let n = cast<i64>(v & 15);
+    if n < 10 {
+        return cast<u8>(48 + n);
+    }
+    return cast<u8>(87 + n);
+}
+
+fn append_hex_rgb(allocator: Allocator, color: Rgb, out: &var string::String) -> mem::Error!void {
+    try out.append_byte(allocator, 35);
+    try out.append_byte(allocator, hex_nibble(color.r >> 4));
+    try out.append_byte(allocator, hex_nibble(color.r));
+    try out.append_byte(allocator, hex_nibble(color.g >> 4));
+    try out.append_byte(allocator, hex_nibble(color.g));
+    try out.append_byte(allocator, hex_nibble(color.b >> 4));
+    try out.append_byte(allocator, hex_nibble(color.b));
+    return;
+}
+
+fn same_rgb(a: Rgb, b: Rgb) -> bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b;
+}
+
+fn (self: &GhosttyScreen) read_cell_text_len() -> usize {
+    unsafe ptr_write(
+        cast<ptr<GhosttyBuffer>>(self.slot),
+        GhosttyBuffer { data: self.text_buf, cap: self.text_cap, len: 0 }
+    );
+    let res = unsafe ghostty_render_state_row_cells_get(self.cells_iter, 9, self.slot);
+    let buf = unsafe ptr_read(cast<ptr<GhosttyBuffer>>(self.slot));
+    if res == 0 or res == -3 {
+        return buf.len;
+    }
+    return 0;
+}
+
+fn (self: &var GhosttyScreen) append_cell_text(
+    allocator: Allocator,
+    out: &var string::String
+) -> TermFailure!bool {
+    var length = self.read_cell_text_len();
+    if length > self.text_cap {
+        let grown = unsafe malloc(length) orelse return mem::Error::OutOfMemory;
+        unsafe free(self.text_buf);
+        unsafe self.text_buf = grown;
+        unsafe self.text_cap = length;
+        length = self.read_cell_text_len();
+        if length > self.text_cap {
+            return GhosttyError::Refused;
+        }
+    }
+    if length == 0 {
+        return false;
+    }
+    let bytes = unsafe view_from_ptr(cast<ptr<const u8>>(self.text_buf), cast<i64>(length));
+    try out.append_bytes(allocator, bytes);
+    return true;
+}
+
+fn flush_run(
+    allocator: Allocator,
+    enc: &var json::Encoder,
+    text: &var string::String,
+    fg: Rgb,
+    has_bg: bool,
+    bg: Rgb,
+    bold: bool,
+    italic: bool
+) -> mem::Error!void {
+    if text.len() == 0 {
+        return;
+    }
+    var fg_hex = string::new(allocator);
+    defer fg_hex.deinit(allocator);
+    try append_hex_rgb(allocator, fg, &var fg_hex);
+
+    var bg_hex = string::new(allocator);
+    defer bg_hex.deinit(allocator);
+    if has_bg {
+        try append_hex_rgb(allocator, bg, &var bg_hex);
+    }
+
+    try enc.begin_object();
+    let t_bytes = text.as_bytes();
+    try enc.write_bytes_field("t", t_bytes);
+    let f_bytes = fg_hex.as_bytes();
+    try enc.write_bytes_field("fg", f_bytes);
+    let b_bytes = bg_hex.as_bytes();
+    try enc.write_bytes_field("bg", b_bytes);
+    try enc.write_bool_field("b", bold);
+    try enc.write_bool_field("i", italic);
+    try enc.end_object();
+    text.clear();
+    return;
+}
+
+pub fn (self: &var GhosttyScreen) encode_snapshot_json(
+    allocator: Allocator,
+    cols: u16,
+    rows: u16,
+    exited: bool,
+    cwd: &string::String,
+    out: &var string::String
+) -> TermFailure!void {
+    if unsafe ghostty_render_state_update(self.render_state, self.terminal) != 0 {
+        return GhosttyError::Refused;
+    }
+    var bg_default = Rgb { r: 22, g: 23, b: 27 };
+    var fg_default = Rgb { r: 236, g: 238, b: 242 };
+    if unsafe ghostty_render_state_get(self.render_state, 5, self.slot) == 0 {
+        bg_default = slot_read_rgb(self.slot);
+    }
+    if unsafe ghostty_render_state_get(self.render_state, 6, self.slot) == 0 {
+        fg_default = slot_read_rgb(self.slot);
+    }
+
+    var cursor_visible = false;
+    var cursor_x: i64 = 0;
+    var cursor_y: i64 = 0;
+    if unsafe ghostty_render_state_get(self.render_state, 11, self.slot) == 0 and slot_read_bool(self.slot) {
+        if unsafe ghostty_render_state_get(self.render_state, 14, self.slot) == 0 and slot_read_bool(self.slot) {
+            if unsafe ghostty_render_state_get(self.render_state, 15, self.slot) == 0 {
+                cursor_x = cast<i64>(slot_read_u16(self.slot));
+            }
+            if unsafe ghostty_render_state_get(self.render_state, 16, self.slot) == 0 {
+                cursor_y = cast<i64>(slot_read_u16(self.slot));
+            }
+            cursor_visible = true;
+        }
+    }
+
+    var scroll_total: i64 = 0;
+    var scroll_offset: i64 = 0;
+    var scroll_len: i64 = 0;
+    if unsafe ghostty_terminal_get(self.terminal, 9, self.slot) == 0 {
+        let sb = unsafe ptr_read(cast<ptr<TerminalScrollbar>>(self.slot));
+        scroll_total = cast<i64>(sb.total);
+        scroll_offset = cast<i64>(sb.offset);
+        scroll_len = cast<i64>(sb.len);
+    }
+
+    var alternate = false;
+    if unsafe ghostty_terminal_get(self.terminal, 6, self.slot) == 0 {
+        alternate = slot_read_i32(self.slot) == 1;
+    }
+
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_i64_field("cols", cast<i64>(cols));
+    try enc.write_i64_field("rows", cast<i64>(rows));
+    try enc.write_bool_field("exited", exited);
+    try enc.write_bool_field("alternate", alternate);
+    try enc.write_bool_field("cursor_visible", cursor_visible);
+    try enc.write_i64_field("cursor_x", cursor_x);
+    try enc.write_i64_field("cursor_y", cursor_y);
+    try enc.write_i64_field("scroll_total", scroll_total);
+    try enc.write_i64_field("scroll_offset", scroll_offset);
+    try enc.write_i64_field("scroll_len", scroll_len);
+    let cwd_bytes = cwd.as_bytes();
+    try enc.write_bytes_field("cwd", cwd_bytes);
+
+    var bg_hex = string::new(allocator);
+    defer bg_hex.deinit(allocator);
+    try append_hex_rgb(allocator, bg_default, &var bg_hex);
+    let bg_hex_bytes = bg_hex.as_bytes();
+    try enc.write_bytes_field("background", bg_hex_bytes);
+
+    var fg_hex = string::new(allocator);
+    defer fg_hex.deinit(allocator);
+    try append_hex_rgb(allocator, fg_default, &var fg_hex);
+    let fg_hex_bytes = fg_hex.as_bytes();
+    try enc.write_bytes_field("foreground", fg_hex_bytes);
+
+    try enc.begin_array_field("lines");
+    slot_write_handle(self.slot, self.rows_iter);
+    if unsafe ghostty_render_state_get(self.render_state, 4, self.slot) == 0 {
+        var run_text = string::new(allocator);
+        defer run_text.deinit(allocator);
+        var cell_text = string::new(allocator);
+        defer cell_text.deinit(allocator);
+        while unsafe ghostty_render_state_row_iterator_next(self.rows_iter) {
+            try enc.begin_array();
+            slot_write_handle(self.slot, self.cells_iter);
+            if unsafe ghostty_render_state_row_get(self.rows_iter, 3, self.slot) == 0 {
+                var run_fg = fg_default;
+                var run_has_bg = false;
+                var run_bg = bg_default;
+                var run_bold = false;
+                var run_italic = false;
+                run_text.clear();
+
+                while unsafe ghostty_render_state_row_cells_next(self.cells_iter) {
+                    zero_slot(self.slot);
+                    slot_write_usize(self.slot, mem::size_of<GhosttyStyle>());
+                    var bold = false;
+                    var italic = false;
+                    var inverse = false;
+                    var invisible = false;
+                    if unsafe ghostty_render_state_row_cells_get(self.cells_iter, 2, self.slot) == 0 {
+                        let st = unsafe ptr_read(cast<ptr<GhosttyStyle>>(self.slot));
+                        bold = st.bold;
+                        italic = st.italic;
+                        inverse = st.inverse;
+                        invisible = st.invisible;
+                    }
+                    var fg = fg_default;
+                    if unsafe ghostty_render_state_row_cells_get(self.cells_iter, 6, self.slot) == 0 {
+                        fg = slot_read_rgb(self.slot);
+                    }
+                    var has_bg = false;
+                    var bg = bg_default;
+                    if unsafe ghostty_render_state_row_cells_get(self.cells_iter, 5, self.slot) == 0 {
+                        has_bg = true;
+                        bg = slot_read_rgb(self.slot);
+                    }
+                    if inverse {
+                        let inv_bg = fg;
+                        fg = bg_default;
+                        if has_bg {
+                            fg = bg;
+                        }
+                        has_bg = true;
+                        bg = inv_bg;
+                    }
+                    if has_bg and same_rgb(bg, bg_default) {
+                        has_bg = false;
+                    }
+
+                    cell_text.clear();
+                    var wrote = false;
+                    if !invisible {
+                        wrote = try self.append_cell_text(allocator, &var cell_text);
+                    }
+                    if !wrote {
+                        try cell_text.append_byte(allocator, 32);
+                    }
+
+                    let same_style = same_rgb(fg, run_fg) and
+                        has_bg == run_has_bg and
+                        (!has_bg or same_rgb(bg, run_bg)) and
+                        bold == run_bold and
+                        italic == run_italic;
+                    if run_text.len() > 0 and !same_style {
+                        try flush_run(
+                            allocator,
+                            &var enc,
+                            &var run_text,
+                            run_fg,
+                            run_has_bg,
+                            run_bg,
+                            run_bold,
+                            run_italic
+                        );
+                    }
+                    if run_text.len() == 0 {
+                        run_fg = fg;
+                        run_has_bg = has_bg;
+                        run_bg = bg;
+                        run_bold = bold;
+                        run_italic = italic;
+                    }
+                    try run_text.append_string(allocator, &cell_text);
+                }
+                try flush_run(
+                    allocator,
+                    &var enc,
+                    &var run_text,
+                    run_fg,
+                    run_has_bg,
+                    run_bg,
+                    run_bold,
+                    run_italic
+                );
+            }
+            try enc.end_array();
+            slot_write_usize(self.slot, 0);
+            let _ = unsafe ghostty_render_state_row_set(self.rows_iter, 0, self.slot);
+        }
+    }
+    try enc.end_array();
+    slot_write_usize(self.slot, 0);
+    let _ = unsafe ghostty_render_state_set(self.render_state, 0, self.slot);
+
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}

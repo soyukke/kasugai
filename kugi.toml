@@ -1,0 +1,65 @@
+[store]
+max_size = "4GB"
+
+[tools.kizu]
+github = "kizu-lang/kizu"
+version = "0.8.0"
+tag = "v{version}"
+asset = "kizu-v{version}-{os}-{arch}.tar.gz"
+arch_map = { aarch64 = "arm64", x86_64 = "amd64" }
+extract = "all"
+bin = ["bin/kizu"]
+
+[tools.ripgrep]
+github = "BurntSushi/ripgrep"
+version = "15.2.0"
+tag = "{version}"
+asset = "ripgrep-{version}-{arch}-{os}.tar.gz"
+os_map = { darwin = "apple-darwin", linux = "unknown-linux-musl" }
+bin = ["rg"]
+
+[tools.shfmt]
+github = "mvdan/sh"
+version = "3.12.0"
+tag = "v{version}"
+asset = "shfmt_v{version}_{os}_{arch}"
+arch_map = { aarch64 = "arm64", x86_64 = "amd64" }
+archive = "none"
+bin = ["shfmt"]
+
+[tools.shellcheck]
+github = "koalaman/shellcheck"
+version = "0.10.0"
+tag = "v{version}"
+asset = "shellcheck-v{version}.{os}.{arch}.tar.xz"
+bin = ["shellcheck"]
+
+[tools.typos]
+github = "crate-ci/typos"
+version = "1.34.0"
+tag = "v{version}"
+asset = "typos-v{version}-{arch}-{os}.tar.gz"
+os_map = { darwin = "apple-darwin", linux = "unknown-linux-musl" }
+bin = ["typos"]
+
+[tools.zig]
+version = "0.15.2"
+url = "https://ziglang.org/download/{version}/zig-{arch}-{os}-{version}.tar.xz"
+os_map = { darwin = "macos" }
+extract = "all"
+bin = ["zig"]
+
+[assets.tlaplus]
+github = "tlaplus/tlaplus"
+version = "1.8.0"
+tag = "v{version}"
+asset = "tla2tools.jar"
+archive = "none"
+
+[wrappers.tlc]
+exec = "java"
+args = ["-XX:+UseParallelGC", "-cp", "{asset.tlaplus}/tla2tools.jar", "tlc2.TLC"]
+
+[env]
+KIZU_LIB_DIR = "{tool.kizu}/lib/kizu"
+ZIG_LIB_DIR = "{tool.zig}/lib"

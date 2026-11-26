@@ -1,0 +1,58 @@
+import std::mem;
+import std::string;
+import std::testing;
+
+test "provider telemetry suppression specs include expected flags and env" {
+    let allocator = mem::page_allocator();
+
+    var agy = string::new(allocator);
+    defer agy.deinit(allocator);
+    try format_launch_spec(allocator, ProviderKind::AntigravityAcp, true, &var agy);
+    let agy_bytes = agy.as_bytes();
+    testing::expect(mem::equal_bytes(agy_bytes, "AGY_DISABLE_TELEMETRY=1 agy acp --disable-telemetry"));
+
+    var agy_off = string::new(allocator);
+    defer agy_off.deinit(allocator);
+    try format_launch_spec(allocator, ProviderKind::AntigravityAcp, false, &var agy_off);
+    let agy_off_bytes = agy_off.as_bytes();
+    testing::expect(mem::equal_bytes(agy_off_bytes, "agy acp"));
+
+    var claude = string::new(allocator);
+    defer claude.deinit(allocator);
+    try format_launch_spec(allocator, ProviderKind::ClaudeCode, true, &var claude);
+    let claude_bytes = claude.as_bytes();
+    testing::expect(mem::equal_bytes(
+        claude_bytes,
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 claude -p --verbose --input-format stream-json --output-format stream-json --include-partial-messages --permission-prompts host"
+    ));
+
+    var opencode = string::new(allocator);
+    defer opencode.deinit(allocator);
+    try format_launch_spec(allocator, ProviderKind::OpenCodeAcp, true, &var opencode);
+    let opencode_bytes = opencode.as_bytes();
+    testing::expect(mem::equal_bytes(opencode_bytes, "OPENCODE_DISABLE_TELEMETRY=1 opencode acp"));
+
+    var codex = string::new(allocator);
+    defer codex.deinit(allocator);
+    try format_launch_spec(allocator, ProviderKind::Codex, true, &var codex);
+    let codex_bytes = codex.as_bytes();
+    testing::expect(mem::equal_bytes(codex_bytes, "CODEX_DISABLE_TELEMETRY=1 codex app-server --stdio"));
+}
+
+test "local turn execution emits chunks and full echoed response" {
+    let allocator = mem::page_allocator();
+    let result = try execute_local_turn(
+        allocator,
+        ProviderKind::LocalEcho,
+        "local-echo",
+        ReasoningEffort::High,
+        "こんにちは",
+        2,
+        true
+    );
+    defer result.deinit(allocator);
+
+    testing::expect_equal<i64>(2, result.chunks.len());
+    let final_bytes = result.final_text.as_bytes();
+    testing::expect(mem::len(final_bytes) > 0);
+}

@@ -1,0 +1,123 @@
+import std::mem;
+import std::string;
+
+pub error RuntimeFailure = GhosttyError or PtyError or mem::Error;
+
+pub struct TerminalRuntime {
+    pty: Pty,
+    screen: GhosttyScreen,
+    cols: u16,
+    rows: u16,
+    cwd: string::String,
+}
+
+fn clamp_dim(value: u16, fallback: u16) -> u16 {
+    if value < 2 {
+        return fallback;
+    }
+    if value > 500 {
+        return 500;
+    }
+    return value;
+}
+
+pub fn spawn_terminal_command(
+    allocator: Allocator,
+    cwd: []u8,
+    command: []u8,
+    cols: u16,
+    rows: u16
+) -> RuntimeFailure!TerminalRuntime {
+    let safe_cols = clamp_dim(cols, 80);
+    let safe_rows = clamp_dim(rows, 24);
+    var cwd_copy = try string::from_bytes(allocator, cwd);
+    errdefer cwd_copy.deinit(allocator);
+    let screen = try new_ghostty_screen(safe_cols, safe_rows, 2000);
+    errdefer screen.deinit();
+    let pty = try spawn_pty(allocator, cwd, command, safe_cols, safe_rows);
+    return TerminalRuntime {
+        pty: move pty,
+        screen: move screen,
+        cols: safe_cols,
+        rows: safe_rows,
+        cwd: move cwd_copy
+    };
+}
+
+pub fn spawn_terminal(
+    allocator: Allocator,
+    cwd: []u8,
+    cols: u16,
+    rows: u16
+) -> RuntimeFailure!TerminalRuntime {
+    return spawn_terminal_command(allocator, cwd, "", cols, rows);
+}
+
+pub fn (self: TerminalRuntime) deinit(allocator: Allocator) -> void {
+    self.pty.deinit();
+    self.screen.deinit();
+    self.cwd.deinit(allocator);
+}
+
+pub fn (self: &TerminalRuntime) wakeup_fd() -> i32 {
+    return self.pty.wakeup_fd();
+}
+
+pub fn (self: &var TerminalRuntime) drain(allocator: Allocator) -> mem::Error!bool {
+    var chunk = string::new(allocator);
+    defer chunk.deinit(allocator);
+    var changed = try self.pty.read_available(allocator, &var chunk);
+    if chunk.len() > 0 {
+        let bytes = chunk.as_bytes();
+        self.screen.feed(bytes);
+        var replies = string::new(allocator);
+        defer replies.deinit(allocator);
+        try self.screen.take_replies(allocator, &var replies);
+        if replies.len() > 0 {
+            let reply_bytes = replies.as_bytes();
+            let _ = self.pty.write_all(reply_bytes);
+        }
+    }
+    let was_exited = self.pty.exited;
+    if self.pty.poll_exited() and !was_exited {
+        changed = true;
+    }
+    return changed;
+}
+
+pub fn (self: &var TerminalRuntime) write_input(bytes: []u8) -> bool {
+    if mem::len(bytes) == 0 {
+        return true;
+    }
+    self.screen.scroll_bottom();
+    return self.pty.write_all(bytes);
+}
+
+pub fn (self: &var TerminalRuntime) resize(cols: u16, rows: u16) -> bool {
+    let safe_cols = clamp_dim(cols, 80);
+    let safe_rows = clamp_dim(rows, 24);
+    self.cols = safe_cols;
+    self.rows = safe_rows;
+    let screen_ok = self.screen.resize(safe_cols, safe_rows);
+    let _ = self.pty.resize(safe_cols, safe_rows);
+    return screen_ok;
+}
+
+pub fn (self: &var TerminalRuntime) scroll(delta_lines: i64) -> void {
+    if delta_lines != 0 {
+        self.screen.scroll_delta(delta_lines);
+    }
+    return;
+}
+
+pub fn (self: &var TerminalRuntime) exited() -> bool {
+    return self.pty.poll_exited();
+}
+
+pub fn (self: &var TerminalRuntime) snapshot_json(
+    allocator: Allocator,
+    out: &var string::String
+) -> TermFailure!void {
+    let is_exited = self.pty.poll_exited();
+    return self.screen.encode_snapshot_json(allocator, self.cols, self.rows, is_exited, &self.cwd, out);
+}

@@ -1,0 +1,1984 @@
+import std::array;
+import std::json;
+import std::mem;
+import std::string;
+
+pub enum WireSignalKind {
+    Ignore,
+    InitializeResult,
+    SessionCreated,
+    ModelCatalog,
+    Delta,
+    AssistantFallback,
+    Activity,
+    PermissionRequest,
+    UnknownRequest,
+    TurnDone,
+    TurnError,
+}
+
+pub struct WireSignal {
+    pub kind: WireSignalKind,
+    pub req_id: i64,
+    pub str_req_id: string::String,
+    pub session_id: string::String,
+    pub call_id: string::String,
+    pub activity_kind: string::String,
+    pub activity_status: string::String,
+    pub text: string::String,
+    pub detail: string::String,
+    pub allow_option_id: string::String,
+    pub reject_option_id: string::String,
+    pub model_option_id: string::String,
+    pub effort_option_id: string::String,
+    pub current_model: string::String,
+    pub models: array::Array<string::String>,
+}
+
+pub fn new_wire_signal(allocator: Allocator) -> WireSignal {
+    return WireSignal {
+        kind: WireSignalKind::Ignore,
+        req_id: 0,
+        str_req_id: string::new(allocator),
+        session_id: string::new(allocator),
+        call_id: string::new(allocator),
+        activity_kind: string::new(allocator),
+        activity_status: string::new(allocator),
+        text: string::new(allocator),
+        detail: string::new(allocator),
+        allow_option_id: string::new(allocator),
+        reject_option_id: string::new(allocator),
+        model_option_id: string::new(allocator),
+        effort_option_id: string::new(allocator),
+        current_model: string::new(allocator),
+        models: array::new<string::String>(allocator)
+    };
+}
+
+pub fn (self: WireSignal) deinit(allocator: Allocator) -> void {
+    self.str_req_id.deinit(allocator);
+    self.session_id.deinit(allocator);
+    self.call_id.deinit(allocator);
+    self.activity_kind.deinit(allocator);
+    self.activity_status.deinit(allocator);
+    self.text.deinit(allocator);
+    self.detail.deinit(allocator);
+    self.allow_option_id.deinit(allocator);
+    self.reject_option_id.deinit(allocator);
+    self.model_option_id.deinit(allocator);
+    self.effort_option_id.deinit(allocator);
+    self.current_model.deinit(allocator);
+    self.models.deinit(allocator);
+}
+
+fn ascii_lower(byte: u8) -> u8 {
+    if byte >= cast<u8>(65) and byte <= cast<u8>(90) {
+        return cast<u8>(cast<i64>(byte) + 32);
+    }
+    return byte;
+}
+
+fn ends_with_ascii_ci(bytes: []u8, suffix: []u8) -> bool {
+    let b_len = mem::len(bytes);
+    let s_len = mem::len(suffix);
+    if s_len > b_len {
+        return false;
+    }
+    let start = b_len - s_len;
+    var index: i64 = 0;
+    while index < s_len {
+        if ascii_lower(bytes[start + index]) != ascii_lower(suffix[index]) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+pub fn is_image_path(path: []u8) -> bool {
+    return ends_with_ascii_ci(path, ".png") or
+        ends_with_ascii_ci(path, ".jpg") or
+        ends_with_ascii_ci(path, ".jpeg") or
+        ends_with_ascii_ci(path, ".gif") or
+        ends_with_ascii_ci(path, ".webp");
+}
+
+fn append_prompt_with_attachments(
+    allocator: Allocator,
+    prompt: []u8,
+    attachments: &array::Array<string::String>,
+    skip_images: bool,
+    out: &var string::String
+) -> mem::Error!void {
+    try out.append_bytes(allocator, prompt);
+    var index: i64 = 0;
+    var added = false;
+    while attachments.at(index) |item| {
+        let bytes = item.as_bytes();
+        if mem::len(bytes) > 0 and (!skip_images or !is_image_path(bytes)) {
+            if !added {
+                try out.append_byte(allocator, 10);
+                added = true;
+            }
+            try out.append_byte(allocator, 10);
+            try out.append_bytes(allocator, "[Local attachment: ");
+            try out.append_bytes(allocator, bytes);
+            try out.append_bytes(allocator, "]");
+        }
+        index = index + 1;
+    }
+    return;
+}
+
+pub fn encode_acp_initialize(
+    allocator: Allocator,
+    req_id: i64,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("jsonrpc", "2.0");
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "initialize");
+    try enc.begin_object_field("params");
+    try enc.write_i64_field("protocolVersion", 1);
+    try enc.begin_object_field("clientCapabilities");
+    try enc.end_object();
+    try enc.begin_object_field("clientInfo");
+    try enc.write_bytes_field("name", "kasugai");
+    try enc.write_bytes_field("version", "0.1.0");
+    try enc.end_object();
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_acp_session_new(
+    allocator: Allocator,
+    req_id: i64,
+    cwd: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("jsonrpc", "2.0");
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "session/new");
+    try enc.begin_object_field("params");
+    try enc.write_bytes_field("cwd", cwd);
+    try enc.begin_array_field("mcpServers");
+    try enc.end_array();
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_acp_session_load(
+    allocator: Allocator,
+    req_id: i64,
+    session_id: []u8,
+    cwd: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("jsonrpc", "2.0");
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "session/load");
+    try enc.begin_object_field("params");
+    try enc.write_bytes_field("sessionId", session_id);
+    try enc.write_bytes_field("cwd", cwd);
+    try enc.begin_array_field("mcpServers");
+    try enc.end_array();
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_acp_set_config(
+    allocator: Allocator,
+    req_id: i64,
+    session_id: []u8,
+    config_id: []u8,
+    value: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("jsonrpc", "2.0");
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "session/set_config_option");
+    try enc.begin_object_field("params");
+    try enc.write_bytes_field("sessionId", session_id);
+    try enc.write_bytes_field("configId", config_id);
+    try enc.write_bytes_field("value", value);
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+fn write_acp_prompt_text(
+    enc: &var json::Encoder,
+    text: &string::String
+) -> mem::Error!void {
+    let bytes = text.as_bytes();
+    return enc.write_bytes_field("text", bytes);
+}
+
+pub fn encode_acp_prompt(
+    allocator: Allocator,
+    req_id: i64,
+    session_id: []u8,
+    prompt: []u8,
+    attachments: &array::Array<string::String>,
+    out: &var string::String
+) -> mem::Error!void {
+    var full = string::new(allocator);
+    defer full.deinit(allocator);
+    try append_prompt_with_attachments(allocator, prompt, attachments, false, &var full);
+
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("jsonrpc", "2.0");
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "session/prompt");
+    try enc.begin_object_field("params");
+    try enc.write_bytes_field("sessionId", session_id);
+    try enc.begin_array_field("prompt");
+    try enc.begin_object();
+    try enc.write_bytes_field("type", "text");
+    try write_acp_prompt_text(&var enc, &full);
+    try enc.end_object();
+    try enc.end_array();
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_acp_permission_reply(
+    allocator: Allocator,
+    req_id: i64,
+    option_id: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("jsonrpc", "2.0");
+    try enc.write_i64_field("id", req_id);
+    try enc.begin_object_field("result");
+    try enc.begin_object_field("outcome");
+    if mem::len(option_id) > 0 {
+        try enc.write_bytes_field("outcome", "selected");
+        try enc.write_bytes_field("optionId", option_id);
+    } else {
+        try enc.write_bytes_field("outcome", "cancelled");
+    }
+    try enc.end_object();
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_acp_permission_reply_str_id(
+    allocator: Allocator,
+    req_id: []u8,
+    option_id: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("jsonrpc", "2.0");
+    try enc.write_bytes_field("id", req_id);
+    try enc.begin_object_field("result");
+    try enc.begin_object_field("outcome");
+    if mem::len(option_id) > 0 {
+        try enc.write_bytes_field("outcome", "selected");
+        try enc.write_bytes_field("optionId", option_id);
+    } else {
+        try enc.write_bytes_field("outcome", "cancelled");
+    }
+    try enc.end_object();
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_rpc_method_not_found(
+    allocator: Allocator,
+    req_id: i64,
+    str_req_id: []u8,
+    method: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var msg = try string::from_bytes(allocator, "Method not found: ");
+    defer msg.deinit(allocator);
+    if mem::len(method) > 0 {
+        try msg.append_bytes(allocator, method);
+    } else {
+        try msg.append_bytes(allocator, "unknown");
+    }
+    let msg_bytes = msg.as_bytes();
+
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("jsonrpc", "2.0");
+    if mem::len(str_req_id) > 0 {
+        try enc.write_bytes_field("id", str_req_id);
+    } else {
+        try enc.write_i64_field("id", req_id);
+    }
+    try enc.begin_object_field("error");
+    try enc.write_i64_field("code", -32601);
+    try enc.write_bytes_field("message", msg_bytes);
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_acp_cancel(
+    allocator: Allocator,
+    session_id: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("jsonrpc", "2.0");
+    try enc.write_bytes_field("method", "session/cancel");
+    try enc.begin_object_field("params");
+    try enc.write_bytes_field("sessionId", session_id);
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+fn write_claude_content(enc: &var json::Encoder, content: &string::String) -> mem::Error!void {
+    let bytes = content.as_bytes();
+    return enc.write_bytes_field("content", bytes);
+}
+
+pub fn encode_claude_user_message(
+    allocator: Allocator,
+    prompt: []u8,
+    attachments: &array::Array<string::String>,
+    out: &var string::String
+) -> mem::Error!void {
+    var full = string::new(allocator);
+    defer full.deinit(allocator);
+    try append_prompt_with_attachments(allocator, prompt, attachments, false, &var full);
+
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("type", "user");
+    try enc.begin_object_field("message");
+    try enc.write_bytes_field("role", "user");
+    try write_claude_content(&var enc, &full);
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_claude_control_response(
+    allocator: Allocator,
+    request_id: []u8,
+    approve: bool,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("type", "control_response");
+    try enc.begin_object_field("response");
+    try enc.write_bytes_field("subtype", "success");
+    try enc.write_bytes_field("request_id", request_id);
+    try enc.begin_object_field("response");
+    if approve {
+        try enc.write_bytes_field("behavior", "allow");
+        try enc.begin_object_field("updatedInput");
+        try enc.end_object();
+    } else {
+        try enc.write_bytes_field("behavior", "deny");
+        try enc.write_bytes_field("message", "Denied by user");
+    }
+    try enc.end_object();
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_codex_initialize(
+    allocator: Allocator,
+    req_id: i64,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "initialize");
+    try enc.begin_object_field("params");
+    try enc.begin_object_field("clientInfo");
+    try enc.write_bytes_field("name", "kasugai");
+    try enc.write_bytes_field("version", "0.1.0");
+    try enc.end_object();
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_codex_initialized(allocator: Allocator, out: &var string::String) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_bytes_field("method", "initialized");
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_codex_model_list(
+    allocator: Allocator,
+    req_id: i64,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "model/list");
+    try enc.begin_object_field("params");
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_codex_thread_start(
+    allocator: Allocator,
+    req_id: i64,
+    cwd: []u8,
+    model: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "thread/start");
+    try enc.begin_object_field("params");
+    try enc.write_bytes_field("cwd", cwd);
+    try enc.write_bytes_field("approvalPolicy", "on-request");
+    if mem::len(model) > 0 and !mem::equal_bytes(model, "default") {
+        try enc.write_bytes_field("model", model);
+    }
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_codex_thread_resume(
+    allocator: Allocator,
+    req_id: i64,
+    thread_id: []u8,
+    cwd: []u8,
+    model: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "thread/resume");
+    try enc.begin_object_field("params");
+    try enc.write_bytes_field("threadId", thread_id);
+    try enc.write_bytes_field("cwd", cwd);
+    try enc.write_bytes_field("approvalPolicy", "on-request");
+    if mem::len(model) > 0 and !mem::equal_bytes(model, "default") {
+        try enc.write_bytes_field("model", model);
+    }
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_codex_turn_start(
+    allocator: Allocator,
+    req_id: i64,
+    thread_id: []u8,
+    prompt: []u8,
+    attachments: &array::Array<string::String>,
+    model: []u8,
+    effort: ReasoningEffort,
+    out: &var string::String
+) -> mem::Error!void {
+    var full = string::new(allocator);
+    defer full.deinit(allocator);
+    try append_prompt_with_attachments(allocator, prompt, attachments, true, &var full);
+
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "turn/start");
+    try enc.begin_object_field("params");
+    try enc.write_bytes_field("threadId", thread_id);
+    try enc.begin_array_field("input");
+    try enc.begin_object();
+    try enc.write_bytes_field("type", "text");
+    try write_acp_prompt_text(&var enc, &full);
+    try enc.begin_array_field("text_elements");
+    try enc.end_array();
+    try enc.end_object();
+    var index: i64 = 0;
+    while attachments.at(index) |item| {
+        let bytes = item.as_bytes();
+        if mem::len(bytes) > 0 and is_image_path(bytes) {
+            try enc.begin_object();
+            try enc.write_bytes_field("type", "localImage");
+            try enc.write_bytes_field("path", bytes);
+            try enc.end_object();
+        }
+        index = index + 1;
+    }
+    try enc.end_array();
+    if mem::len(model) > 0 and !mem::equal_bytes(model, "default") {
+        try enc.write_bytes_field("model", model);
+    }
+    try enc.write_bytes_field("effort", effort_id(effort));
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_codex_approval_reply(
+    allocator: Allocator,
+    req_id: i64,
+    approve: bool,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_i64_field("id", req_id);
+    try enc.begin_object_field("result");
+    if approve {
+        try enc.write_bytes_field("decision", "accept");
+    } else {
+        try enc.write_bytes_field("decision", "decline");
+    }
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub fn encode_codex_turn_interrupt(
+    allocator: Allocator,
+    req_id: i64,
+    thread_id: []u8,
+    out: &var string::String
+) -> mem::Error!void {
+    var enc = json::encoder(allocator);
+    defer enc.deinit(allocator);
+    try enc.begin_object();
+    try enc.write_i64_field("id", req_id);
+    try enc.write_bytes_field("method", "turn/interrupt");
+    try enc.begin_object_field("params");
+    try enc.write_bytes_field("threadId", thread_id);
+    try enc.end_object();
+    try enc.end_object();
+    return enc.finish_into(allocator, out);
+}
+
+pub struct RpcMethodHeader {
+    pub method: ?string::String,
+}
+
+pub fn (self: RpcMethodHeader) deinit(allocator: Allocator) -> void {
+    if self.method |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct RpcStrIdHeader {
+    pub id: ?string::String,
+}
+
+pub fn (self: RpcStrIdHeader) deinit(allocator: Allocator) -> void {
+    if self.id |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct RpcHeader {
+    pub id: ?i64,
+    pub method: ?string::String,
+}
+
+pub fn (self: RpcHeader) deinit(allocator: Allocator) -> void {
+    if self.method |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct RpcErrorObj {
+    pub code: ?i64,
+    pub message: ?string::String,
+}
+
+pub fn (self: RpcErrorObj) deinit(allocator: Allocator) -> void {
+    if self.message |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct RpcErrorEnvelope {
+    pub error: ?RpcErrorObj,
+}
+
+pub fn (self: RpcErrorEnvelope) deinit(allocator: Allocator) -> void {
+    if self.error |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpConfigChoice {
+    pub value: ?string::String,
+    pub name: ?string::String,
+}
+
+pub fn (self: AcpConfigChoice) deinit(allocator: Allocator) -> void {
+    if self.value |val| {
+        val.deinit(allocator);
+    }
+    if self.name |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpConfigOption {
+    pub id: ?string::String,
+    pub category: ?string::String,
+    pub currentValue: ?string::String,
+    pub options: ?array::Array<AcpConfigChoice>,
+}
+
+pub fn (self: AcpConfigOption) deinit(allocator: Allocator) -> void {
+    if self.id |val| {
+        val.deinit(allocator);
+    }
+    if self.category |val| {
+        val.deinit(allocator);
+    }
+    if self.currentValue |val| {
+        val.deinit(allocator);
+    }
+    if self.options |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpSessionNewResult {
+    pub sessionId: ?string::String,
+    pub configOptions: ?array::Array<AcpConfigOption>,
+}
+
+pub fn (self: AcpSessionNewResult) deinit(allocator: Allocator) -> void {
+    if self.sessionId |val| {
+        val.deinit(allocator);
+    }
+    if self.configOptions |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpSessionNewEnvelope {
+    pub result: ?AcpSessionNewResult,
+}
+
+pub fn (self: AcpSessionNewEnvelope) deinit(allocator: Allocator) -> void {
+    if self.result |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpUpdateKindBody {
+    pub sessionUpdate: ?string::String,
+}
+
+pub fn (self: AcpUpdateKindBody) deinit(allocator: Allocator) -> void {
+    if self.sessionUpdate |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpUpdateKindParams {
+    pub update: ?AcpUpdateKindBody,
+}
+
+pub fn (self: AcpUpdateKindParams) deinit(allocator: Allocator) -> void {
+    if self.update |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpUpdateKindEnvelope {
+    pub params: ?AcpUpdateKindParams,
+}
+
+pub fn (self: AcpUpdateKindEnvelope) deinit(allocator: Allocator) -> void {
+    if self.params |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpContentText {
+    pub text: ?string::String,
+}
+
+pub fn (self: AcpContentText) deinit(allocator: Allocator) -> void {
+    if self.text |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpChunkBody {
+    pub content: ?AcpContentText,
+    pub text: ?string::String,
+}
+
+pub fn (self: AcpChunkBody) deinit(allocator: Allocator) -> void {
+    if self.content |val| {
+        val.deinit(allocator);
+    }
+    if self.text |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpChunkParams {
+    pub update: ?AcpChunkBody,
+}
+
+pub fn (self: AcpChunkParams) deinit(allocator: Allocator) -> void {
+    if self.update |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpChunkEnvelope {
+    pub params: ?AcpChunkParams,
+}
+
+pub fn (self: AcpChunkEnvelope) deinit(allocator: Allocator) -> void {
+    if self.params |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpToolUpdateBody {
+    pub toolCallId: ?string::String,
+    pub title: ?string::String,
+    pub name: ?string::String,
+    pub kind: ?string::String,
+    pub status: ?string::String,
+}
+
+pub fn (self: AcpToolUpdateBody) deinit(allocator: Allocator) -> void {
+    if self.toolCallId |val| {
+        val.deinit(allocator);
+    }
+    if self.title |val| {
+        val.deinit(allocator);
+    }
+    if self.name |val| {
+        val.deinit(allocator);
+    }
+    if self.kind |val| {
+        val.deinit(allocator);
+    }
+    if self.status |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpToolUpdateParams {
+    pub update: ?AcpToolUpdateBody,
+}
+
+pub fn (self: AcpToolUpdateParams) deinit(allocator: Allocator) -> void {
+    if self.update |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpToolUpdateEnvelope {
+    pub params: ?AcpToolUpdateParams,
+}
+
+pub fn (self: AcpToolUpdateEnvelope) deinit(allocator: Allocator) -> void {
+    if self.params |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpToolCall {
+    pub title: ?string::String,
+    pub name: ?string::String,
+    pub kind: ?string::String,
+}
+
+pub fn (self: AcpToolCall) deinit(allocator: Allocator) -> void {
+    if self.title |val| {
+        val.deinit(allocator);
+    }
+    if self.name |val| {
+        val.deinit(allocator);
+    }
+    if self.kind |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpPermissionOption {
+    pub optionId: ?string::String,
+    pub kind: ?string::String,
+    pub name: ?string::String,
+}
+
+pub fn (self: AcpPermissionOption) deinit(allocator: Allocator) -> void {
+    if self.optionId |val| {
+        val.deinit(allocator);
+    }
+    if self.kind |val| {
+        val.deinit(allocator);
+    }
+    if self.name |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpPermissionParams {
+    pub toolCall: ?AcpToolCall,
+    pub options: ?array::Array<AcpPermissionOption>,
+}
+
+pub fn (self: AcpPermissionParams) deinit(allocator: Allocator) -> void {
+    if self.toolCall |val| {
+        val.deinit(allocator);
+    }
+    if self.options |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct AcpPermissionEnvelope {
+    pub params: ?AcpPermissionParams,
+}
+
+pub fn (self: AcpPermissionEnvelope) deinit(allocator: Allocator) -> void {
+    if self.params |val| {
+        val.deinit(allocator);
+    }
+}
+
+fn extract_rpc_request_id(
+    allocator: Allocator,
+    line: []u8,
+    signal: &var WireSignal
+) -> mem::Error!bool {
+    if json::decode_ignore_unknown<RpcHeader>(allocator, line) |num_hdr| {
+        defer num_hdr.deinit(allocator);
+        if num_hdr.id |req_id| {
+            signal.req_id = req_id;
+            return true;
+        }
+    } else |_| {}
+    if json::decode_ignore_unknown<RpcStrIdHeader>(allocator, line) |str_hdr| {
+        defer str_hdr.deinit(allocator);
+        if str_hdr.id |sid| {
+            try signal.str_req_id.append_string(allocator, sid);
+            return true;
+        }
+    } else |_| {}
+    return false;
+}
+
+fn string_equals(value: &string::String, target: []u8) -> bool {
+    let bytes = value.as_bytes();
+    return mem::equal_bytes(bytes, target);
+}
+
+fn extract_rpc_error(allocator: Allocator, line: []u8, out: &var string::String) -> mem::Error!bool {
+    if json::decode_ignore_unknown<RpcErrorEnvelope>(allocator, line) |env| {
+        defer env.deinit(allocator);
+        if env.error |err_obj| {
+            if err_obj.message |msg| {
+                try out.append_string(allocator, msg);
+            } else {
+                try out.append_bytes(allocator, "JSON-RPC error");
+            }
+            return true;
+        }
+    } else |_| {}
+    return false;
+}
+
+fn push_unique_model(
+    allocator: Allocator,
+    models: &var array::Array<string::String>,
+    candidate: &string::String
+) -> mem::Error!void {
+    let bytes = candidate.as_bytes();
+    if mem::len(bytes) == 0 {
+        return;
+    }
+    var index: i64 = 0;
+    while models.at(index) |existing| {
+        if string_equals(existing, bytes) {
+            return;
+        }
+        index = index + 1;
+    }
+    var copy = try string::from_bytes(allocator, bytes);
+    errdefer copy.deinit(allocator);
+    return models.append(allocator, move copy);
+}
+
+fn collect_acp_config_options(
+    allocator: Allocator,
+    options: &array::Array<AcpConfigOption>,
+    signal: &var WireSignal
+) -> mem::Error!void {
+    var index: i64 = 0;
+    while options.at(index) |opt| {
+        var is_model = false;
+        var is_effort = false;
+        if opt.category |cat| {
+            if string_equals(cat, "model") {
+                is_model = true;
+            }
+            if string_equals(cat, "thought_level") or string_equals(cat, "reasoning_effort") {
+                is_effort = true;
+            }
+        }
+        if opt.id |opt_id| {
+            if string_equals(opt_id, "model") {
+                is_model = true;
+            }
+            if string_equals(opt_id, "reasoning_effort") or string_equals(opt_id, "thought_level") or
+                string_equals(opt_id, "variant") {
+                is_effort = true;
+            }
+        }
+        if is_model {
+            if opt.id |opt_id| {
+                signal.model_option_id.clear();
+                try signal.model_option_id.append_string(allocator, opt_id);
+            }
+            if opt.currentValue |cur| {
+                signal.current_model.clear();
+                try signal.current_model.append_string(allocator, cur);
+                try push_unique_model(allocator, &var signal.models, cur);
+            }
+            if opt.options |choices| {
+                var c_idx: i64 = 0;
+                while choices.at(c_idx) |choice| {
+                    if choice.value |val| {
+                        try push_unique_model(allocator, &var signal.models, val);
+                    }
+                    c_idx = c_idx + 1;
+                }
+            }
+        }
+        if is_effort {
+            if opt.id |opt_id| {
+                signal.effort_option_id.clear();
+                try signal.effort_option_id.append_string(allocator, opt_id);
+            }
+        }
+        index = index + 1;
+    }
+    return;
+}
+
+pub fn parse_acp_line(
+    allocator: Allocator,
+    line: []u8,
+    init_req_id: i64,
+    session_new_req_id: i64,
+    prompt_req_id: i64
+) -> mem::Error!WireSignal {
+    var signal = new_wire_signal(allocator);
+    errdefer signal.deinit(allocator);
+    if json::decode_ignore_unknown<RpcMethodHeader>(allocator, line) |m_header| {
+        defer m_header.deinit(allocator);
+        if m_header.method |method| {
+            if string_equals(method, "session/update") {
+                if json::decode_ignore_unknown<AcpUpdateKindEnvelope>(allocator, line) |kind_env| {
+                    defer kind_env.deinit(allocator);
+                    var is_chunk = false;
+                    var is_thought = false;
+                    var is_tool = false;
+                    if kind_env.params |params| {
+                        if params.update |upd| {
+                            if upd.sessionUpdate |su| {
+                                if string_equals(su, "agent_message_chunk") {
+                                    is_chunk = true;
+                                } else if string_equals(su, "agent_thought_chunk") {
+                                    is_thought = true;
+                                } else if string_equals(su, "tool_call") or
+                                    string_equals(su, "tool_call_update") {
+                                    is_tool = true;
+                                }
+                            }
+                        }
+                    }
+                    if is_chunk {
+                        if json::decode_ignore_unknown<AcpChunkEnvelope>(allocator, line) |chunk_env| {
+                            defer chunk_env.deinit(allocator);
+                            if chunk_env.params |params| {
+                                if params.update |upd| {
+                                    if upd.content |content| {
+                                        if content.text |txt| {
+                                            try signal.text.append_string(allocator, txt);
+                                        }
+                                    } else if upd.text |txt| {
+                                        try signal.text.append_string(allocator, txt);
+                                    }
+                                }
+                            }
+                            if signal.text.len() > 0 {
+                                signal.kind = WireSignalKind::Delta;
+                            }
+                        } else |_| {}
+                    } else if is_thought {
+                        if json::decode_ignore_unknown<AcpChunkEnvelope>(allocator, line) |chunk_env| {
+                            defer chunk_env.deinit(allocator);
+                            if chunk_env.params |params| {
+                                if params.update |upd| {
+                                    if upd.content |content| {
+                                        if content.text |txt| {
+                                            try signal.detail.append_string(allocator, txt);
+                                        }
+                                    } else if upd.text |txt| {
+                                        try signal.detail.append_string(allocator, txt);
+                                    }
+                                }
+                            }
+                            if signal.detail.len() > 0 {
+                                signal.kind = WireSignalKind::Activity;
+                                try signal.call_id.append_bytes(allocator, "thought");
+                                try signal.activity_kind.append_bytes(allocator, "thought");
+                                try signal.activity_status.append_bytes(allocator, "running");
+                                try signal.text.append_bytes(allocator, "思考中");
+                            }
+                        } else |_| {}
+                    } else if is_tool {
+                        if json::decode_ignore_unknown<AcpToolUpdateEnvelope>(allocator, line) |tool_env| {
+                            defer tool_env.deinit(allocator);
+                            if tool_env.params |params| {
+                                if params.update |upd| {
+                                    signal.kind = WireSignalKind::Activity;
+                                    try signal.activity_kind.append_bytes(allocator, "tool");
+                                    if upd.toolCallId |cid| {
+                                        try signal.call_id.append_string(allocator, cid);
+                                    }
+                                    if upd.title |title| {
+                                        try signal.text.append_string(allocator, title);
+                                    } else if upd.name |name| {
+                                        try signal.text.append_string(allocator, name);
+                                    } else if upd.kind |k| {
+                                        try signal.text.append_string(allocator, k);
+                                    } else {
+                                        try signal.text.append_bytes(allocator, "ツール実行");
+                                    }
+                                    if upd.status |st| {
+                                        if string_equals(st, "completed") or string_equals(st, "done") {
+                                            try signal.activity_status.append_bytes(allocator, "completed");
+                                        } else if string_equals(st, "failed") or string_equals(st, "error") {
+                                            try signal.activity_status.append_bytes(allocator, "failed");
+                                        } else {
+                                            try signal.activity_status.append_bytes(allocator, "running");
+                                        }
+                                    } else {
+                                        try signal.activity_status.append_bytes(allocator, "running");
+                                    }
+                                }
+                            }
+                        } else |_| {}
+                    }
+                } else |_| {}
+                return move signal;
+            }
+            if string_equals(method, "session/request_permission") {
+                signal.kind = WireSignalKind::PermissionRequest;
+                let _ = try extract_rpc_request_id(allocator, line, &var signal);
+                if json::decode_ignore_unknown<AcpPermissionEnvelope>(allocator, line) |perm_env| {
+                    defer perm_env.deinit(allocator);
+                    if perm_env.params |params| {
+                        if params.toolCall |tc| {
+                            if tc.name |n| {
+                                try signal.text.append_string(allocator, n);
+                            } else if tc.kind |k| {
+                                try signal.text.append_string(allocator, k);
+                            }
+                            if tc.title |t| {
+                                try signal.detail.append_string(allocator, t);
+                            }
+                        }
+                        if params.options |opts| {
+                            var o_idx: i64 = 0;
+                            while opts.at(o_idx) |opt| {
+                                if opt.optionId |oid| {
+                                    if opt.kind |okind| {
+                                        if (string_equals(okind, "allow_once") or string_equals(okind, "allow_always")) and
+                                            signal.allow_option_id.len() == 0 {
+                                            try signal.allow_option_id.append_string(allocator, oid);
+                                        }
+                                        if (string_equals(okind, "reject_once") or string_equals(okind, "reject_always")) and
+                                            signal.reject_option_id.len() == 0 {
+                                            try signal.reject_option_id.append_string(allocator, oid);
+                                        }
+                                    }
+                                    if signal.allow_option_id.len() == 0 and o_idx == 0 {
+                                        try signal.allow_option_id.append_string(allocator, oid);
+                                    }
+                                }
+                                o_idx = o_idx + 1;
+                            }
+                        }
+                    }
+                } else |_| {}
+                if signal.text.len() == 0 {
+                    try signal.text.append_bytes(allocator, "tool");
+                }
+                if signal.detail.len() == 0 {
+                    try signal.detail.append_bytes(allocator, "ツール実行の承認が必要です");
+                }
+                return move signal;
+            }
+            if try extract_rpc_request_id(allocator, line, &var signal) {
+                signal.kind = WireSignalKind::UnknownRequest;
+                try signal.text.append_string(allocator, method);
+            }
+            return move signal;
+        }
+    } else |_| {}
+    if json::decode_ignore_unknown<RpcHeader>(allocator, line) |header| {
+        defer header.deinit(allocator);
+        let req_id = header.id orelse return move signal;
+        signal.req_id = req_id;
+        var err_msg = string::new(allocator);
+        defer err_msg.deinit(allocator);
+        if try extract_rpc_error(allocator, line, &var err_msg) {
+            signal.kind = WireSignalKind::TurnError;
+            try signal.detail.append_string(allocator, &err_msg);
+            return move signal;
+        }
+
+        if req_id == init_req_id {
+            signal.kind = WireSignalKind::InitializeResult;
+            return move signal;
+        }
+        if req_id == session_new_req_id {
+            if json::decode_ignore_unknown<AcpSessionNewEnvelope>(allocator, line) |env| {
+                defer env.deinit(allocator);
+                if env.result |res| {
+                    if res.sessionId |sid| {
+                        try signal.session_id.append_string(allocator, sid);
+                    }
+                    if res.configOptions |opts| {
+                        try collect_acp_config_options(allocator, opts, &var signal);
+                    }
+                }
+            } else |_| {}
+            signal.kind = WireSignalKind::SessionCreated;
+            return move signal;
+        }
+        if prompt_req_id > 0 and req_id == prompt_req_id {
+            signal.kind = WireSignalKind::TurnDone;
+            return move signal;
+        }
+    } else |_| {}
+    return move signal;
+}
+
+pub struct ClaudeHeader {
+    pub type: ?string::String,
+    pub session_id: ?string::String,
+    pub request_id: ?string::String,
+    pub is_error: ?bool,
+    pub result: ?string::String,
+}
+
+pub fn (self: ClaudeHeader) deinit(allocator: Allocator) -> void {
+    if self.type |val| {
+        val.deinit(allocator);
+    }
+    if self.session_id |val| {
+        val.deinit(allocator);
+    }
+    if self.request_id |val| {
+        val.deinit(allocator);
+    }
+    if self.result |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeDeltaObj {
+    pub text: ?string::String,
+}
+
+pub fn (self: ClaudeDeltaObj) deinit(allocator: Allocator) -> void {
+    if self.text |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeContentBlockStart {
+    pub type: ?string::String,
+    pub id: ?string::String,
+    pub name: ?string::String,
+}
+
+pub fn (self: ClaudeContentBlockStart) deinit(allocator: Allocator) -> void {
+    if self.type |val| {
+        val.deinit(allocator);
+    }
+    if self.id |val| {
+        val.deinit(allocator);
+    }
+    if self.name |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeStreamEventObj {
+    pub type: ?string::String,
+    pub delta: ?ClaudeDeltaObj,
+    pub content_block: ?ClaudeContentBlockStart,
+}
+
+pub fn (self: ClaudeStreamEventObj) deinit(allocator: Allocator) -> void {
+    if self.type |val| {
+        val.deinit(allocator);
+    }
+    if self.delta |val| {
+        val.deinit(allocator);
+    }
+    if self.content_block |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeStreamEnvelope {
+    pub event: ?ClaudeStreamEventObj,
+}
+
+pub fn (self: ClaudeStreamEnvelope) deinit(allocator: Allocator) -> void {
+    if self.event |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeContentBlock {
+    pub type: ?string::String,
+    pub id: ?string::String,
+    pub name: ?string::String,
+    pub text: ?string::String,
+    pub tool_use_id: ?string::String,
+    pub is_error: ?bool,
+    pub input: ?ClaudeToolInput,
+}
+
+pub fn (self: ClaudeContentBlock) deinit(allocator: Allocator) -> void {
+    if self.type |val| {
+        val.deinit(allocator);
+    }
+    if self.id |val| {
+        val.deinit(allocator);
+    }
+    if self.name |val| {
+        val.deinit(allocator);
+    }
+    if self.text |val| {
+        val.deinit(allocator);
+    }
+    if self.tool_use_id |val| {
+        val.deinit(allocator);
+    }
+    if self.input |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeAssistantMsg {
+    pub content: ?array::Array<ClaudeContentBlock>,
+}
+
+pub fn (self: ClaudeAssistantMsg) deinit(allocator: Allocator) -> void {
+    if self.content |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeAssistantEnvelope {
+    pub message: ?ClaudeAssistantMsg,
+}
+
+pub fn (self: ClaudeAssistantEnvelope) deinit(allocator: Allocator) -> void {
+    if self.message |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeToolInput {
+    pub command: ?string::String,
+    pub description: ?string::String,
+    pub file_path: ?string::String,
+}
+
+pub fn (self: ClaudeToolInput) deinit(allocator: Allocator) -> void {
+    if self.command |val| {
+        val.deinit(allocator);
+    }
+    if self.description |val| {
+        val.deinit(allocator);
+    }
+    if self.file_path |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeControlReq {
+    pub subtype: ?string::String,
+    pub tool_name: ?string::String,
+    pub input: ?ClaudeToolInput,
+}
+
+pub fn (self: ClaudeControlReq) deinit(allocator: Allocator) -> void {
+    if self.subtype |val| {
+        val.deinit(allocator);
+    }
+    if self.tool_name |val| {
+        val.deinit(allocator);
+    }
+    if self.input |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct ClaudeControlEnvelope {
+    pub request: ?ClaudeControlReq,
+}
+
+pub fn (self: ClaudeControlEnvelope) deinit(allocator: Allocator) -> void {
+    if self.request |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub fn parse_claude_line(allocator: Allocator, line: []u8) -> mem::Error!WireSignal {
+    var signal = new_wire_signal(allocator);
+    errdefer signal.deinit(allocator);
+    if json::decode_ignore_unknown<ClaudeHeader>(allocator, line) |header| {
+        defer header.deinit(allocator);
+        if header.session_id |sid| {
+            try signal.session_id.append_string(allocator, sid);
+        }
+        if header.type |kind_str| {
+            if string_equals(kind_str, "system") {
+                if signal.session_id.len() > 0 {
+                    signal.kind = WireSignalKind::SessionCreated;
+                }
+                return move signal;
+            }
+            if string_equals(kind_str, "stream_event") {
+                if json::decode_ignore_unknown<ClaudeStreamEnvelope>(allocator, line) |env| {
+                    defer env.deinit(allocator);
+                    if env.event |ev| {
+                        if ev.type |et| {
+                            if string_equals(et, "content_block_delta") {
+                                if ev.delta |delta| {
+                                    if delta.text |txt| {
+                                        try signal.text.append_string(allocator, txt);
+                                        if signal.text.len() > 0 {
+                                            signal.kind = WireSignalKind::Delta;
+                                        }
+                                    }
+                                }
+                            } else if string_equals(et, "content_block_start") {
+                                if ev.content_block |blk| {
+                                    if blk.type |bt| {
+                                        if string_equals(bt, "tool_use") {
+                                            signal.kind = WireSignalKind::Activity;
+                                            try signal.activity_kind.append_bytes(allocator, "tool");
+                                            try signal.activity_status.append_bytes(allocator, "running");
+                                            if blk.id |cid| {
+                                                try signal.call_id.append_string(allocator, cid);
+                                            }
+                                            if blk.name |nm| {
+                                                try signal.text.append_string(allocator, nm);
+                                            } else {
+                                                try signal.text.append_bytes(allocator, "ツール実行");
+                                            }
+                                        } else if string_equals(bt, "thinking") {
+                                            signal.kind = WireSignalKind::Activity;
+                                            try signal.call_id.append_bytes(allocator, "thought");
+                                            try signal.activity_kind.append_bytes(allocator, "thought");
+                                            try signal.activity_status.append_bytes(allocator, "running");
+                                            try signal.text.append_bytes(allocator, "思考中");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else |_| {}
+                return move signal;
+            }
+            if string_equals(kind_str, "assistant") {
+                if json::decode_ignore_unknown<ClaudeAssistantEnvelope>(allocator, line) |env| {
+                    defer env.deinit(allocator);
+                    var found_tool = false;
+                    if env.message |msg| {
+                        if msg.content |blocks| {
+                            var idx: i64 = 0;
+                            while blocks.at(idx) |blk| {
+                                if blk.type |bt| {
+                                    if string_equals(bt, "tool_use") {
+                                        found_tool = true;
+                                        signal.kind = WireSignalKind::Activity;
+                                        signal.call_id.clear();
+                                        signal.activity_kind.clear();
+                                        signal.activity_status.clear();
+                                        signal.text.clear();
+                                        signal.detail.clear();
+                                        try signal.activity_kind.append_bytes(allocator, "tool");
+                                        try signal.activity_status.append_bytes(allocator, "running");
+                                        if blk.id |cid| {
+                                            try signal.call_id.append_string(allocator, cid);
+                                        }
+                                        if blk.name |nm| {
+                                            try signal.text.append_string(allocator, nm);
+                                        } else {
+                                            try signal.text.append_bytes(allocator, "ツール実行");
+                                        }
+                                        if blk.input |inp| {
+                                            if inp.command |cmd| {
+                                                try signal.detail.append_string(allocator, cmd);
+                                            } else if inp.file_path |fp| {
+                                                try signal.detail.append_string(allocator, fp);
+                                            } else if inp.description |desc| {
+                                                try signal.detail.append_string(allocator, desc);
+                                            }
+                                        }
+                                    }
+                                }
+                                if !found_tool {
+                                    if blk.text |txt| {
+                                        try signal.text.append_string(allocator, txt);
+                                    }
+                                }
+                                idx = idx + 1;
+                            }
+                        }
+                    }
+                    if !found_tool and signal.text.len() > 0 {
+                        signal.kind = WireSignalKind::AssistantFallback;
+                    }
+                } else |_| {}
+                return move signal;
+            }
+            if string_equals(kind_str, "user") {
+                if json::decode_ignore_unknown<ClaudeAssistantEnvelope>(allocator, line) |env| {
+                    defer env.deinit(allocator);
+                    if env.message |msg| {
+                        if msg.content |blocks| {
+                            var idx: i64 = 0;
+                            while blocks.at(idx) |blk| {
+                                if blk.type |bt| {
+                                    if string_equals(bt, "tool_result") {
+                                        signal.kind = WireSignalKind::Activity;
+                                        signal.call_id.clear();
+                                        signal.activity_kind.clear();
+                                        signal.activity_status.clear();
+                                        try signal.activity_kind.append_bytes(allocator, "tool");
+                                        if blk.tool_use_id |cid| {
+                                            try signal.call_id.append_string(allocator, cid);
+                                        }
+                                        let errored = blk.is_error orelse false;
+                                        if errored {
+                                            try signal.activity_status.append_bytes(allocator, "failed");
+                                        } else {
+                                            try signal.activity_status.append_bytes(allocator, "completed");
+                                        }
+                                        break;
+                                    }
+                                }
+                                idx = idx + 1;
+                            }
+                        }
+                    }
+                } else |_| {}
+                return move signal;
+            }
+            if string_equals(kind_str, "control_request") {
+                if header.request_id |rid| {
+                    try signal.str_req_id.append_string(allocator, rid);
+                }
+                if json::decode_ignore_unknown<ClaudeControlEnvelope>(allocator, line) |env| {
+                    defer env.deinit(allocator);
+                    if env.request |req| {
+                        var is_tool = true;
+                        if req.subtype |sub| {
+                            if !string_equals(sub, "can_use_tool") {
+                                is_tool = false;
+                            }
+                        }
+                        if is_tool {
+                            signal.kind = WireSignalKind::PermissionRequest;
+                            if req.tool_name |tn| {
+                                try signal.text.append_string(allocator, tn);
+                            }
+                            if req.input |inp| {
+                                if inp.command |cmd| {
+                                    try signal.detail.append_string(allocator, cmd);
+                                } else if inp.file_path |fp| {
+                                    try signal.detail.append_string(allocator, fp);
+                                } else if inp.description |desc| {
+                                    try signal.detail.append_string(allocator, desc);
+                                }
+                            }
+                        }
+                    }
+                } else |_| {}
+                if signal.kind == WireSignalKind::PermissionRequest {
+                    if signal.text.len() == 0 {
+                        try signal.text.append_bytes(allocator, "tool");
+                    }
+                    if signal.detail.len() == 0 {
+                        try signal.detail.append_bytes(allocator, "ツール実行の承認が必要です");
+                    }
+                }
+                return move signal;
+            }
+            if string_equals(kind_str, "result") {
+                let is_err = header.is_error orelse false;
+                if is_err {
+                    signal.kind = WireSignalKind::TurnError;
+                    if header.result |res| {
+                        try signal.detail.append_string(allocator, res);
+                    } else {
+                        try signal.detail.append_bytes(allocator, "Claude Code ターンがエラー終了しました");
+                    }
+                } else {
+                    signal.kind = WireSignalKind::TurnDone;
+                    if header.result |res| {
+                        try signal.text.append_string(allocator, res);
+                    }
+                }
+                return move signal;
+            }
+        }
+    } else |_| {}
+    return move signal;
+}
+
+pub struct CodexThreadInfo {
+    pub id: ?string::String,
+}
+
+pub fn (self: CodexThreadInfo) deinit(allocator: Allocator) -> void {
+    if self.id |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexThreadStartResult {
+    pub thread: ?CodexThreadInfo,
+}
+
+pub fn (self: CodexThreadStartResult) deinit(allocator: Allocator) -> void {
+    if self.thread |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexThreadStartEnvelope {
+    pub result: ?CodexThreadStartResult,
+}
+
+pub fn (self: CodexThreadStartEnvelope) deinit(allocator: Allocator) -> void {
+    if self.result |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexModelItem {
+    pub id: ?string::String,
+    pub model: ?string::String,
+}
+
+pub fn (self: CodexModelItem) deinit(allocator: Allocator) -> void {
+    if self.id |val| {
+        val.deinit(allocator);
+    }
+    if self.model |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexModelListResult {
+    pub data: ?array::Array<CodexModelItem>,
+}
+
+pub fn (self: CodexModelListResult) deinit(allocator: Allocator) -> void {
+    if self.data |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexModelListEnvelope {
+    pub result: ?CodexModelListResult,
+}
+
+pub fn (self: CodexModelListEnvelope) deinit(allocator: Allocator) -> void {
+    if self.result |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexDeltaParams {
+    pub delta: ?string::String,
+}
+
+pub fn (self: CodexDeltaParams) deinit(allocator: Allocator) -> void {
+    if self.delta |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexDeltaEnvelope {
+    pub params: ?CodexDeltaParams,
+}
+
+pub fn (self: CodexDeltaEnvelope) deinit(allocator: Allocator) -> void {
+    if self.params |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexErrorMessage {
+    pub message: ?string::String,
+}
+
+pub fn (self: CodexErrorMessage) deinit(allocator: Allocator) -> void {
+    if self.message |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexTurnStatus {
+    pub status: ?string::String,
+    pub error: ?CodexErrorMessage,
+}
+
+pub fn (self: CodexTurnStatus) deinit(allocator: Allocator) -> void {
+    if self.status |val| {
+        val.deinit(allocator);
+    }
+    if self.error |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexTurnCompletedParams {
+    pub turn: ?CodexTurnStatus,
+}
+
+pub fn (self: CodexTurnCompletedParams) deinit(allocator: Allocator) -> void {
+    if self.turn |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexTurnCompletedEnvelope {
+    pub params: ?CodexTurnCompletedParams,
+}
+
+pub fn (self: CodexTurnCompletedEnvelope) deinit(allocator: Allocator) -> void {
+    if self.params |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexItemObj {
+    pub id: ?string::String,
+    pub type: ?string::String,
+    pub command: ?string::String,
+    pub status: ?string::String,
+    pub tool: ?string::String,
+}
+
+pub fn (self: CodexItemObj) deinit(allocator: Allocator) -> void {
+    if self.id |val| {
+        val.deinit(allocator);
+    }
+    if self.type |val| {
+        val.deinit(allocator);
+    }
+    if self.command |val| {
+        val.deinit(allocator);
+    }
+    if self.status |val| {
+        val.deinit(allocator);
+    }
+    if self.tool |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexItemEventParams {
+    pub item: ?CodexItemObj,
+}
+
+pub fn (self: CodexItemEventParams) deinit(allocator: Allocator) -> void {
+    if self.item |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexItemEventEnvelope {
+    pub params: ?CodexItemEventParams,
+}
+
+pub fn (self: CodexItemEventEnvelope) deinit(allocator: Allocator) -> void {
+    if self.params |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexApprovalParams {
+    pub command: ?string::String,
+    pub reason: ?string::String,
+}
+
+pub fn (self: CodexApprovalParams) deinit(allocator: Allocator) -> void {
+    if self.command |val| {
+        val.deinit(allocator);
+    }
+    if self.reason |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub struct CodexApprovalEnvelope {
+    pub params: ?CodexApprovalParams,
+}
+
+pub fn (self: CodexApprovalEnvelope) deinit(allocator: Allocator) -> void {
+    if self.params |val| {
+        val.deinit(allocator);
+    }
+}
+
+pub fn parse_codex_line(
+    allocator: Allocator,
+    line: []u8,
+    init_req_id: i64,
+    model_list_req_id: i64,
+    thread_start_req_id: i64,
+    turn_start_req_id: i64
+) -> mem::Error!WireSignal {
+    var signal = new_wire_signal(allocator);
+    errdefer signal.deinit(allocator);
+    if json::decode_ignore_unknown<RpcMethodHeader>(allocator, line) |m_header| {
+        defer m_header.deinit(allocator);
+        if m_header.method |method| {
+            if string_equals(method, "item/agentMessage/delta") {
+                if json::decode_ignore_unknown<CodexDeltaEnvelope>(allocator, line) |env| {
+                    defer env.deinit(allocator);
+                    if env.params |params| {
+                        if params.delta |delta| {
+                            try signal.text.append_string(allocator, delta);
+                            if signal.text.len() > 0 {
+                                signal.kind = WireSignalKind::Delta;
+                            }
+                        }
+                    }
+                } else |_| {}
+                return move signal;
+            }
+            if string_equals(method, "item/started") or string_equals(method, "item/completed") {
+                let is_completed = string_equals(method, "item/completed");
+                if json::decode_ignore_unknown<CodexItemEventEnvelope>(allocator, line) |env| {
+                    defer env.deinit(allocator);
+                    if env.params |params| {
+                        if params.item |item| {
+                            if item.type |itype| {
+                                if !string_equals(itype, "agentMessage") and
+                                    !string_equals(itype, "userMessage") {
+                                    signal.kind = WireSignalKind::Activity;
+                                    if item.id |cid| {
+                                        try signal.call_id.append_string(allocator, cid);
+                                    }
+                                    if string_equals(itype, "commandExecution") {
+                                        try signal.activity_kind.append_bytes(allocator, "command");
+                                        try signal.text.append_bytes(allocator, "コマンド実行");
+                                    } else if string_equals(itype, "fileChange") {
+                                        try signal.activity_kind.append_bytes(allocator, "tool");
+                                        try signal.text.append_bytes(allocator, "ファイル変更");
+                                    } else if string_equals(itype, "reasoning") {
+                                        try signal.activity_kind.append_bytes(allocator, "thought");
+                                        try signal.text.append_bytes(allocator, "思考中");
+                                    } else {
+                                        try signal.activity_kind.append_bytes(allocator, "tool");
+                                        if item.tool |tname| {
+                                            try signal.text.append_string(allocator, tname);
+                                        } else {
+                                            try signal.text.append_string(allocator, itype);
+                                        }
+                                    }
+                                    if item.command |cmd| {
+                                        try signal.detail.append_string(allocator, cmd);
+                                    }
+                                    if is_completed {
+                                        if item.status |st| {
+                                            if string_equals(st, "failed") or string_equals(st, "declined") {
+                                                try signal.activity_status.append_bytes(allocator, "failed");
+                                            } else {
+                                                try signal.activity_status.append_bytes(allocator, "completed");
+                                            }
+                                        } else {
+                                            try signal.activity_status.append_bytes(allocator, "completed");
+                                        }
+                                    } else {
+                                        try signal.activity_status.append_bytes(allocator, "running");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else |_| {}
+                return move signal;
+            }
+            if string_equals(method, "turn/completed") {
+                signal.kind = WireSignalKind::TurnDone;
+                if json::decode_ignore_unknown<CodexTurnCompletedEnvelope>(allocator, line) |env| {
+                    defer env.deinit(allocator);
+                    if env.params |params| {
+                        if params.turn |turn| {
+                            if turn.status |st| {
+                                if string_equals(st, "failed") or string_equals(st, "interrupted") {
+                                    signal.kind = WireSignalKind::TurnError;
+                                    if turn.error |err_obj| {
+                                        if err_obj.message |msg| {
+                                            try signal.detail.append_string(allocator, msg);
+                                        }
+                                    }
+                                    if signal.detail.len() == 0 {
+                                        try signal.detail.append_bytes(allocator, "Codex ターンが中断または失敗しました");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else |_| {}
+                return move signal;
+            }
+            if string_equals(method, "item/commandExecution/requestApproval") or
+                string_equals(method, "item/fileChange/requestApproval") {
+                signal.kind = WireSignalKind::PermissionRequest;
+                let _ = try extract_rpc_request_id(allocator, line, &var signal);
+                if string_equals(method, "item/fileChange/requestApproval") {
+                    try signal.text.append_bytes(allocator, "file_change");
+                } else {
+                    try signal.text.append_bytes(allocator, "command");
+                }
+                if json::decode_ignore_unknown<CodexApprovalEnvelope>(allocator, line) |env| {
+                    defer env.deinit(allocator);
+                    if env.params |params| {
+                        if params.command |cmd| {
+                            try signal.detail.append_string(allocator, cmd);
+                        } else if params.reason |reason| {
+                            try signal.detail.append_string(allocator, reason);
+                        }
+                    }
+                } else |_| {}
+                if signal.detail.len() == 0 {
+                    try signal.detail.append_bytes(allocator, "ツール実行の承認が必要です");
+                }
+                return move signal;
+            }
+            if try extract_rpc_request_id(allocator, line, &var signal) {
+                signal.kind = WireSignalKind::UnknownRequest;
+                try signal.text.append_string(allocator, method);
+            }
+            return move signal;
+        }
+    } else |_| {}
+    if json::decode_ignore_unknown<RpcHeader>(allocator, line) |header| {
+        defer header.deinit(allocator);
+        let req_id = header.id orelse return move signal;
+        signal.req_id = req_id;
+        var err_msg = string::new(allocator);
+        defer err_msg.deinit(allocator);
+        if try extract_rpc_error(allocator, line, &var err_msg) {
+            if req_id != model_list_req_id {
+                signal.kind = WireSignalKind::TurnError;
+                try signal.detail.append_string(allocator, &err_msg);
+            }
+            return move signal;
+        }
+
+        if req_id == init_req_id {
+            signal.kind = WireSignalKind::InitializeResult;
+            return move signal;
+        }
+        if req_id == model_list_req_id {
+            if json::decode_ignore_unknown<CodexModelListEnvelope>(allocator, line) |env| {
+                defer env.deinit(allocator);
+                if env.result |res| {
+                    if res.data |items| {
+                        var idx: i64 = 0;
+                        while items.at(idx) |item| {
+                            if item.model |m| {
+                                try push_unique_model(allocator, &var signal.models, m);
+                            } else if item.id |mid| {
+                                try push_unique_model(allocator, &var signal.models, mid);
+                            }
+                            idx = idx + 1;
+                        }
+                    }
+                }
+            } else |_| {}
+            signal.kind = WireSignalKind::ModelCatalog;
+            return move signal;
+        }
+        if req_id == thread_start_req_id {
+            if json::decode_ignore_unknown<CodexThreadStartEnvelope>(allocator, line) |env| {
+                defer env.deinit(allocator);
+                if env.result |res| {
+                    if res.thread |th| {
+                        if th.id |tid| {
+                            try signal.session_id.append_string(allocator, tid);
+                        }
+                    }
+                }
+            } else |_| {}
+            signal.kind = WireSignalKind::SessionCreated;
+            return move signal;
+        }
+    } else |_| {}
+    let _ = turn_start_req_id;
+    return move signal;
+}

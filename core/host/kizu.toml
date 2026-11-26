@@ -1,0 +1,9 @@
+[package]
+name = "kasugai"
+version = "0.1.0"
+
+[modules]
+paths = ["../src", "src"]
+
+[native]
+library_search = ["../target/native"]

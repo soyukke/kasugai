@@ -1,0 +1,121 @@
+import std::json;
+import std::mem;
+import std::string;
+
+pub enum WorkspaceMode {
+    ProjectRoot,
+    GitWorktree,
+}
+
+pub fn mode_name(mode: WorkspaceMode) -> []u8 {
+    if mode == WorkspaceMode::GitWorktree {
+        return "git_worktree";
+    }
+    return "project_root";
+}
+
+pub struct WorkspaceBinding {
+    pub mode: WorkspaceMode,
+    pub root_path: string::String,
+    pub worktree_path: string::String,
+    pub branch: string::String,
+    pub base_ref: string::String,
+    pub diff_files_changed: i64,
+    pub diff_insertions: i64,
+    pub diff_deletions: i64,
+}
+
+pub fn (self: WorkspaceBinding) deinit(allocator: Allocator) -> void {
+    self.root_path.deinit(allocator);
+    self.worktree_path.deinit(allocator);
+    self.branch.deinit(allocator);
+    self.base_ref.deinit(allocator);
+}
+
+pub fn new_root_binding(allocator: Allocator, root_path: []u8) -> mem::Error!WorkspaceBinding {
+    var root_copy = try string::from_bytes(allocator, root_path);
+    errdefer root_copy.deinit(allocator);
+    return WorkspaceBinding {
+        mode: WorkspaceMode::ProjectRoot,
+        root_path: move root_copy,
+        worktree_path: string::new(allocator),
+        branch: string::new(allocator),
+        base_ref: string::new(allocator),
+        diff_files_changed: 0,
+        diff_insertions: 0,
+        diff_deletions: 0
+    };
+}
+
+fn is_blank_bytes(bytes: []u8) -> bool {
+    var index = 0;
+    while index < mem::len(bytes) {
+        let byte = bytes[index];
+        if byte != cast<u8>(32) and byte != cast<u8>(9) and byte != cast<u8>(10) and
+            byte != cast<u8>(13) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+pub fn (self: &var WorkspaceBinding) bind_worktree(
+    allocator: Allocator,
+    branch: []u8,
+    base_ref: []u8,
+    worktree_path: []u8
+) -> mem::Error!bool {
+    if is_blank_bytes(branch) or is_blank_bytes(worktree_path) {
+        return false;
+    }
+    self.mode = WorkspaceMode::GitWorktree;
+    self.branch.clear();
+    try self.branch.append_bytes(allocator, branch);
+    self.base_ref.clear();
+    try self.base_ref.append_bytes(allocator, base_ref);
+    self.worktree_path.clear();
+    try self.worktree_path.append_bytes(allocator, worktree_path);
+    return true;
+}
+
+pub fn (self: &var WorkspaceBinding) reset_to_root() -> void {
+    self.mode = WorkspaceMode::ProjectRoot;
+    self.branch.clear();
+    self.base_ref.clear();
+    self.worktree_path.clear();
+    return;
+}
+
+pub fn (self: &var WorkspaceBinding) update_diff_stats(files_changed: i64, insertions: i64, deletions: i64) -> void {
+    if files_changed >= 0 {
+        self.diff_files_changed = files_changed;
+    }
+    if insertions >= 0 {
+        self.diff_insertions = insertions;
+    }
+    if deletions >= 0 {
+        self.diff_deletions = deletions;
+    }
+    return;
+}
+
+pub fn write_workspace_json(encoder: &var json::Encoder, binding: &WorkspaceBinding) -> mem::Error!void {
+    try encoder.write_bytes_field("mode", mode_name(binding.mode));
+    let root_bytes = binding.root_path.as_bytes();
+    try encoder.write_bytes_field("root_path", root_bytes);
+    let wt_bytes = binding.worktree_path.as_bytes();
+    try encoder.write_bytes_field("worktree_path", wt_bytes);
+    if binding.mode == WorkspaceMode::GitWorktree and mem::len(wt_bytes) > 0 {
+        try encoder.write_bytes_field("effective_cwd", wt_bytes);
+    } else {
+        try encoder.write_bytes_field("effective_cwd", root_bytes);
+    }
+    let branch_bytes = binding.branch.as_bytes();
+    try encoder.write_bytes_field("branch", branch_bytes);
+    let base_bytes = binding.base_ref.as_bytes();
+    try encoder.write_bytes_field("base_ref", base_bytes);
+    try encoder.write_i64_field("diff_files_changed", binding.diff_files_changed);
+    try encoder.write_i64_field("diff_insertions", binding.diff_insertions);
+    return encoder.write_i64_field("diff_deletions", binding.diff_deletions);
+}

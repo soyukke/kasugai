@@ -1,0 +1,133 @@
+import kasugai::event;
+import std::array;
+import std::fmt;
+import std::mem;
+import std::string;
+import std::testing;
+
+extern "c" fn getpid() -> i32
+extern "c" fn unlink(path: ptr<const u8>) -> i32
+test "memory event store appends and parses JSONL lines" {
+    let allocator = mem::page_allocator();
+    var store = new_memory_store(allocator);
+    defer store.deinit(allocator);
+
+    let seq1 = try store.record(
+        allocator,
+        1,
+        10,
+        0,
+        event::EventKind::ThreadCreated,
+        "local_echo",
+        "echo-m0",
+        "medium",
+        "Thread 1",
+        ""
+    );
+    let seq2 = try store.record(
+        allocator,
+        1,
+        10,
+        1,
+        event::EventKind::MessageUser,
+        "local_echo",
+        "echo-m0",
+        "medium",
+        "ping",
+        ""
+    );
+    let seq3 = try store.record(
+        allocator,
+        1,
+        20,
+        2,
+        event::EventKind::MessageUser,
+        "local_echo",
+        "echo-m0",
+        "medium",
+        "other thread",
+        ""
+    );
+    testing::expect_equal<i64>(1, seq1);
+    testing::expect_equal<i64>(2, seq2);
+    testing::expect_equal<i64>(3, seq3);
+    testing::expect_equal<i64>(3, store.count());
+
+    var all_jsonl = string::new(allocator);
+    defer all_jsonl.deinit(allocator);
+    try store.export_jsonl(allocator, 0, &var all_jsonl);
+    var parsed_all = array::new<event::UnifiedEvent>(allocator);
+    defer parsed_all.deinit(allocator);
+    let all_bytes = all_jsonl.as_bytes();
+    testing::expect_equal<i64>(3, try parse_jsonl(allocator, all_bytes, &var parsed_all));
+
+    var filtered = string::new(allocator);
+    defer filtered.deinit(allocator);
+    try store.export_jsonl(allocator, 10, &var filtered);
+    var parsed_filtered = array::new<event::UnifiedEvent>(allocator);
+    defer parsed_filtered.deinit(allocator);
+    let filtered_bytes = filtered.as_bytes();
+    testing::expect_equal<i64>(2, try parse_jsonl(allocator, filtered_bytes, &var parsed_filtered));
+}
+
+test "file-backed event store appends and reloads JSONL on disk" {
+    let allocator = mem::page_allocator();
+    var path = try string::from_bytes(allocator, "/tmp/kasugai-store-test-");
+    defer path.deinit(allocator);
+    let pid = cast<i64>(unsafe getpid());
+    try fmt::append_i64(allocator, &var path, pid);
+    try path.append_bytes(allocator, ".jsonl");
+
+    var c_target = string::new(allocator);
+    defer c_target.deinit(allocator);
+    try c_target.append_string(allocator, &path);
+    try c_target.append_byte(allocator, 0);
+    let c_bytes = c_target.as_bytes();
+    let _ = unsafe unlink(ptr_of(c_bytes));
+
+    let path_bytes = path.as_bytes();
+    var store = try new_file_store(allocator, path_bytes);
+    defer store.deinit(allocator);
+
+    let _ = try store.record(
+        allocator,
+        1,
+        5,
+        1,
+        event::EventKind::TurnEnqueued,
+        "opencode_acp",
+        "default",
+        "high",
+        "check diff",
+        ""
+    );
+    let _ = try store.record(
+        allocator,
+        1,
+        5,
+        1,
+        event::EventKind::TurnCompleted,
+        "opencode_acp",
+        "default",
+        "high",
+        "",
+        ""
+    );
+
+    var raw = string::new(allocator);
+    defer raw.deinit(allocator);
+    testing::expect(try read_file_bytes(allocator, path_bytes, &var raw));
+    var replayed = array::new<event::UnifiedEvent>(allocator);
+    defer replayed.deinit(allocator);
+    let raw_bytes = raw.as_bytes();
+    testing::expect_equal<i64>(2, try parse_jsonl(allocator, raw_bytes, &var replayed));
+    if replayed.at(0) |first| {
+        testing::expect(first.kind == event::EventKind::TurnEnqueued);
+        let text = first.text.as_bytes();
+        testing::expect(mem::equal_bytes(text, "check diff"));
+    } else {
+        testing::fail("missing first replayed event");
+    }
+
+    let _ = unsafe unlink(ptr_of(c_bytes));
+}

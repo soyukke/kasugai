@@ -1,0 +1,311 @@
+import std::json;
+import std::mem;
+import std::string;
+
+pub enum EventKind {
+    ProjectCreated,
+    ThreadCreated,
+    TurnEnqueued,
+    TurnStarted,
+    MessageUser,
+    MessageDelta,
+    MessageCompleted,
+    ToolApprovalRequested,
+    ToolApprovalResolved,
+    TurnCompleted,
+    TurnFailed,
+    ProviderChanged,
+    WorkspaceUpdated,
+    Activity,
+    ThreadRenamed,
+}
+
+pub fn kind_name(kind: EventKind) -> []u8 {
+    if kind == EventKind::ProjectCreated {
+        return "project.created";
+    }
+    if kind == EventKind::ThreadCreated {
+        return "thread.created";
+    }
+    if kind == EventKind::TurnEnqueued {
+        return "turn.enqueued";
+    }
+    if kind == EventKind::TurnStarted {
+        return "turn.started";
+    }
+    if kind == EventKind::MessageUser {
+        return "message.user";
+    }
+    if kind == EventKind::MessageDelta {
+        return "message.delta";
+    }
+    if kind == EventKind::MessageCompleted {
+        return "message.completed";
+    }
+    if kind == EventKind::ToolApprovalRequested {
+        return "tool.approval_requested";
+    }
+    if kind == EventKind::ToolApprovalResolved {
+        return "tool.approval_resolved";
+    }
+    if kind == EventKind::TurnCompleted {
+        return "turn.completed";
+    }
+    if kind == EventKind::TurnFailed {
+        return "turn.failed";
+    }
+    if kind == EventKind::ProviderChanged {
+        return "provider.changed";
+    }
+    if kind == EventKind::Activity {
+        return "activity.updated";
+    }
+    if kind == EventKind::ThreadRenamed {
+        return "thread.renamed";
+    }
+    return "workspace.updated";
+}
+
+pub fn parse_kind(bytes: []u8, out: &var EventKind) -> bool {
+    if mem::equal_bytes(bytes, "project.created") {
+        out = EventKind::ProjectCreated;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "thread.created") {
+        out = EventKind::ThreadCreated;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "turn.enqueued") {
+        out = EventKind::TurnEnqueued;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "turn.started") {
+        out = EventKind::TurnStarted;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "message.user") {
+        out = EventKind::MessageUser;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "message.delta") {
+        out = EventKind::MessageDelta;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "message.completed") {
+        out = EventKind::MessageCompleted;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "tool.approval_requested") {
+        out = EventKind::ToolApprovalRequested;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "tool.approval_resolved") {
+        out = EventKind::ToolApprovalResolved;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "turn.completed") {
+        out = EventKind::TurnCompleted;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "turn.failed") {
+        out = EventKind::TurnFailed;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "provider.changed") {
+        out = EventKind::ProviderChanged;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "workspace.updated") {
+        out = EventKind::WorkspaceUpdated;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "activity.updated") {
+        out = EventKind::Activity;
+        return true;
+    }
+    if mem::equal_bytes(bytes, "thread.renamed") {
+        out = EventKind::ThreadRenamed;
+        return true;
+    }
+    return false;
+}
+
+pub struct UnifiedEvent {
+    pub seq: i64,
+    pub timestamp_ms: i64,
+    pub project_id: i64,
+    pub thread_id: i64,
+    pub turn_id: i64,
+    pub kind: EventKind,
+    pub provider: string::String,
+    pub model: string::String,
+    pub effort: string::String,
+    pub text: string::String,
+    pub detail: string::String,
+}
+
+pub fn (self: UnifiedEvent) deinit(allocator: Allocator) -> void {
+    self.provider.deinit(allocator);
+    self.model.deinit(allocator);
+    self.effort.deinit(allocator);
+    self.text.deinit(allocator);
+    self.detail.deinit(allocator);
+}
+
+pub fn new_event(
+    allocator: Allocator,
+    seq: i64,
+    timestamp_ms: i64,
+    project_id: i64,
+    thread_id: i64,
+    turn_id: i64,
+    kind: EventKind,
+    provider: []u8,
+    model: []u8,
+    effort: []u8,
+    text: []u8,
+    detail: []u8
+) -> mem::Error!UnifiedEvent {
+    var provider_copy = try string::from_bytes(allocator, provider);
+    errdefer provider_copy.deinit(allocator);
+    var model_copy = try string::from_bytes(allocator, model);
+    errdefer model_copy.deinit(allocator);
+    var effort_copy = try string::from_bytes(allocator, effort);
+    errdefer effort_copy.deinit(allocator);
+    var text_copy = try string::from_bytes(allocator, text);
+    errdefer text_copy.deinit(allocator);
+    var detail_copy = try string::from_bytes(allocator, detail);
+    errdefer detail_copy.deinit(allocator);
+    return UnifiedEvent {
+        seq: seq,
+        timestamp_ms: timestamp_ms,
+        project_id: project_id,
+        thread_id: thread_id,
+        turn_id: turn_id,
+        kind: kind,
+        provider: move provider_copy,
+        model: move model_copy,
+        effort: move effort_copy,
+        text: move text_copy,
+        detail: move detail_copy
+    };
+}
+
+pub fn write_event_json(encoder: &var json::Encoder, item: &UnifiedEvent) -> mem::Error!void {
+    try encoder.begin_object();
+    try encoder.write_i64_field("seq", item.seq);
+    try encoder.write_i64_field("timestamp_ms", item.timestamp_ms);
+    try encoder.write_i64_field("project_id", item.project_id);
+    try encoder.write_i64_field("thread_id", item.thread_id);
+    try encoder.write_i64_field("turn_id", item.turn_id);
+    try encoder.write_bytes_field("kind", kind_name(item.kind));
+    let provider_bytes = item.provider.as_bytes();
+    try encoder.write_bytes_field("provider", provider_bytes);
+    let model_bytes = item.model.as_bytes();
+    try encoder.write_bytes_field("model", model_bytes);
+    let effort_bytes = item.effort.as_bytes();
+    try encoder.write_bytes_field("effort", effort_bytes);
+    let text_bytes = item.text.as_bytes();
+    try encoder.write_bytes_field("text", text_bytes);
+    let detail_bytes = item.detail.as_bytes();
+    try encoder.write_bytes_field("detail", detail_bytes);
+    return encoder.end_object();
+}
+
+pub fn encode_event_line(allocator: Allocator, item: &UnifiedEvent, out: &var string::String) -> mem::Error!void {
+    var encoder = json::encoder(allocator);
+    defer encoder.deinit(allocator);
+    try write_event_json(&var encoder, item);
+    return encoder.finish_into(allocator, out);
+}
+
+pub struct EventInput {
+    pub seq: i64,
+    pub timestamp_ms: i64,
+    pub project_id: i64,
+    pub thread_id: i64,
+    pub turn_id: i64,
+    pub kind: string::String,
+    pub provider: ?string::String,
+    pub model: ?string::String,
+    pub effort: ?string::String,
+    pub text: ?string::String,
+    pub detail: ?string::String,
+}
+
+pub fn (self: EventInput) deinit(allocator: Allocator) -> void {
+    self.kind.deinit(allocator);
+    if self.provider |value| {
+        value.deinit(allocator);
+    }
+    if self.model |value| {
+        value.deinit(allocator);
+    }
+    if self.effort |value| {
+        value.deinit(allocator);
+    }
+    if self.text |value| {
+        value.deinit(allocator);
+    }
+    if self.detail |value| {
+        value.deinit(allocator);
+    }
+}
+
+pub error EventParseError {
+    UnknownKind,
+}
+
+pub error DecodeEventError = EventParseError or json::DecodeError;
+
+fn parse_kind_string(value: &string::String, out: &var EventKind) -> bool {
+    let bytes = value.as_bytes();
+    return parse_kind(bytes, out);
+}
+
+pub fn decode_event_line(allocator: Allocator, line: []u8) -> DecodeEventError!UnifiedEvent {
+    var input = try json::decode_ignore_unknown<EventInput>(allocator, line);
+    defer input.deinit(allocator);
+    var parsed_kind = EventKind::WorkspaceUpdated;
+    if !parse_kind_string(&input.kind, &var parsed_kind) {
+        return EventParseError::UnknownKind;
+    }
+    var provider_copy = string::new(allocator);
+    errdefer provider_copy.deinit(allocator);
+    if input.provider |present| {
+        try provider_copy.append_string(allocator, present);
+    }
+    var model_copy = string::new(allocator);
+    errdefer model_copy.deinit(allocator);
+    if input.model |present| {
+        try model_copy.append_string(allocator, present);
+    }
+    var effort_copy = string::new(allocator);
+    errdefer effort_copy.deinit(allocator);
+    if input.effort |present| {
+        try effort_copy.append_string(allocator, present);
+    }
+    var text_copy = string::new(allocator);
+    errdefer text_copy.deinit(allocator);
+    if input.text |present| {
+        try text_copy.append_string(allocator, present);
+    }
+    var detail_copy = string::new(allocator);
+    errdefer detail_copy.deinit(allocator);
+    if input.detail |present| {
+        try detail_copy.append_string(allocator, present);
+    }
+    return UnifiedEvent {
+        seq: input.seq,
+        timestamp_ms: input.timestamp_ms,
+        project_id: input.project_id,
+        thread_id: input.thread_id,
+        turn_id: input.turn_id,
+        kind: parsed_kind,
+        provider: move provider_copy,
+        model: move model_copy,
+        effort: move effort_copy,
+        text: move text_copy,
+        detail: move detail_copy
+    };
+}

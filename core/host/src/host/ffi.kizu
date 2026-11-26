@@ -1,0 +1,565 @@
+import kasugai::engine;
+import kasugai::provider;
+import std::mem;
+import std::string;
+
+export "c" fn kasugai_core_create_with_store(
+    default_project_name: ?ptr<const u8>,
+    default_project_path: ?ptr<const u8>,
+    store_path: ?ptr<const u8>
+) -> ?ptr<engine::Core> {
+    let allocator = mem::page_allocator();
+    var name = string::new(allocator);
+    defer name.deinit(allocator);
+    if default_project_name |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if name.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return null;
+        }
+    }
+    var path = string::new(allocator);
+    defer path.deinit(allocator);
+    if default_project_path |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if path.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return null;
+        }
+    }
+    var store = string::new(allocator);
+    defer store.deinit(allocator);
+    if store_path |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if store.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return null;
+        }
+    }
+    let name_bytes = name.as_bytes();
+    let path_bytes = path.as_bytes();
+    let store_bytes = store.as_bytes();
+    if engine::new_core_with_store(allocator, name_bytes, path_bytes, store_bytes) |value| {
+        let storage = unsafe malloc(mem::size_of<engine::Core>());
+        if storage |slot| {
+            let handle = unsafe cast<ptr<engine::Core>>(slot);
+            unsafe ptr_write(handle, move value);
+            return handle;
+        }
+        value.deinit(allocator);
+    } else |_| {}
+    return null;
+}
+
+export "c" fn kasugai_core_create(
+    default_project_name: ?ptr<const u8>,
+    default_project_path: ?ptr<const u8>
+) -> ?ptr<engine::Core> {
+    return kasugai_core_create_with_store(default_project_name, default_project_path, null);
+}
+
+export "c" fn kasugai_core_destroy(handle: ?ptr<engine::Core>) -> void {
+    if handle |live| {
+        let value = unsafe ptr_read(live);
+        value.deinit(mem::page_allocator());
+        unsafe free(cast<ptr<u8>>(live));
+    }
+    return;
+}
+
+export "c" fn kasugai_core_add_project(
+    handle: ?ptr<engine::Core>,
+    name: ?ptr<const u8>,
+    root_path: ?ptr<const u8>
+) -> i64 {
+    let live = handle orelse return -1;
+    let raw_name = name orelse return -1;
+    let raw_path = root_path orelse return -1;
+    let allocator = mem::page_allocator();
+    if c_string(allocator, raw_name) |owned_name| {
+        defer owned_name.deinit(allocator);
+        if c_string(allocator, raw_path) |owned_path| {
+            defer owned_path.deinit(allocator);
+            let name_bytes = owned_name.as_bytes();
+            let path_bytes = owned_path.as_bytes();
+            let core = unsafe &var live.*;
+            if core.add_project(allocator, name_bytes, path_bytes) |project_id| {
+                return project_id;
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+    return -1;
+}
+
+export "c" fn kasugai_core_select_project(handle: ?ptr<engine::Core>, project_id: i64) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    return flag(core.select_project(project_id));
+}
+
+export "c" fn kasugai_core_create_thread(
+    handle: ?ptr<engine::Core>,
+    project_id: i64,
+    title: ?ptr<const u8>,
+    provider_name: ?ptr<const u8>,
+    model_name: ?ptr<const u8>,
+    effort_name: ?ptr<const u8>
+) -> i64 {
+    let live = handle orelse return -1;
+    let allocator = mem::page_allocator();
+    var owned_title = string::new(allocator);
+    defer owned_title.deinit(allocator);
+    if title |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if owned_title.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return -1;
+        }
+    }
+    var kind = provider::ProviderKind::LocalEcho;
+    if provider_name |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            let ok = provider::parse_provider(bytes, &var kind);
+            copied.deinit(allocator);
+            if !ok {
+                return -1;
+            }
+        } else |_| {
+            return -1;
+        }
+    }
+    var owned_model = string::new(allocator);
+    defer owned_model.deinit(allocator);
+    if model_name |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if owned_model.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return -1;
+        }
+    }
+    var effort = provider::ReasoningEffort::Medium;
+    if effort_name |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            let ok = provider::parse_effort(bytes, &var effort);
+            copied.deinit(allocator);
+            if !ok {
+                return -1;
+            }
+        } else |_| {
+            return -1;
+        }
+    }
+    let title_bytes = owned_title.as_bytes();
+    let model_bytes = owned_model.as_bytes();
+    let core = unsafe &var live.*;
+    if core.create_thread(allocator, project_id, title_bytes, kind, model_bytes, effort) |thread_id| {
+        return thread_id;
+    } else |_| {}
+    return -1;
+}
+
+export "c" fn kasugai_core_select_thread(handle: ?ptr<engine::Core>, thread_id: i64) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    return flag(core.select_thread(thread_id));
+}
+
+export "c" fn kasugai_core_rename_thread(
+    handle: ?ptr<engine::Core>,
+    thread_id: i64,
+    title: ?ptr<const u8>
+) -> u8 {
+    let live = handle orelse return 0;
+    let raw = title orelse return 0;
+    let allocator = mem::page_allocator();
+    if c_string(allocator, raw) |owned| {
+        defer owned.deinit(allocator);
+        let bytes = owned.as_bytes();
+        let core = unsafe &var live.*;
+        if core.rename_thread(allocator, thread_id, bytes) |done| {
+            return flag(done);
+        } else |_| {}
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_set_thread_provider(
+    handle: ?ptr<engine::Core>,
+    thread_id: i64,
+    provider_name: ?ptr<const u8>,
+    model_name: ?ptr<const u8>,
+    effort_name: ?ptr<const u8>
+) -> u8 {
+    let live = handle orelse return 0;
+    let raw_provider = provider_name orelse return 0;
+    let raw_effort = effort_name orelse return 0;
+    let allocator = mem::page_allocator();
+    var kind = provider::ProviderKind::LocalEcho;
+    if c_string(allocator, raw_provider) |copied| {
+        let bytes = copied.as_bytes();
+        let ok = provider::parse_provider(bytes, &var kind);
+        copied.deinit(allocator);
+        if !ok {
+            return 0;
+        }
+    } else |_| {
+        return 0;
+    }
+    var effort = provider::ReasoningEffort::Medium;
+    if c_string(allocator, raw_effort) |copied| {
+        let bytes = copied.as_bytes();
+        let ok = provider::parse_effort(bytes, &var effort);
+        copied.deinit(allocator);
+        if !ok {
+            return 0;
+        }
+    } else |_| {
+        return 0;
+    }
+    var owned_model = string::new(allocator);
+    defer owned_model.deinit(allocator);
+    if model_name |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if owned_model.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return 0;
+        }
+    }
+    let model_bytes = owned_model.as_bytes();
+    let core = unsafe &var live.*;
+    if core.set_thread_provider(allocator, thread_id, kind, model_bytes, effort) |done| {
+        return flag(done);
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_send_message(
+    handle: ?ptr<engine::Core>,
+    thread_id: i64,
+    text: ?ptr<const u8>,
+    attachments_nl: ?ptr<const u8>
+) -> i64 {
+    let live = handle orelse return -1;
+    let raw_text = text orelse return -1;
+    let allocator = mem::page_allocator();
+    if c_string(allocator, raw_text) |owned_text| {
+        defer owned_text.deinit(allocator);
+        var owned_attachments = string::new(allocator);
+        defer owned_attachments.deinit(allocator);
+        if attachments_nl |raw_att| {
+            if c_string(allocator, raw_att) |copied| {
+                let bytes = copied.as_bytes();
+                if owned_attachments.append_bytes(allocator, bytes) {} else |_| {}
+                copied.deinit(allocator);
+            } else |_| {
+                return -1;
+            }
+        }
+        let text_bytes = owned_text.as_bytes();
+        let att_bytes = owned_attachments.as_bytes();
+        let core = unsafe &var live.*;
+        if core.send_message(allocator, thread_id, text_bytes, att_bytes) |turn_id| {
+            return turn_id;
+        } else |_| {}
+    } else |_| {}
+    return -1;
+}
+
+export "c" fn kasugai_core_enqueue_message(
+    handle: ?ptr<engine::Core>,
+    thread_id: i64,
+    text: ?ptr<const u8>,
+    attachments_nl: ?ptr<const u8>
+) -> i64 {
+    let live = handle orelse return -1;
+    let raw_text = text orelse return -1;
+    let allocator = mem::page_allocator();
+    if c_string(allocator, raw_text) |owned_text| {
+        defer owned_text.deinit(allocator);
+        var owned_attachments = string::new(allocator);
+        defer owned_attachments.deinit(allocator);
+        if attachments_nl |raw_att| {
+            if c_string(allocator, raw_att) |copied| {
+                let bytes = copied.as_bytes();
+                if owned_attachments.append_bytes(allocator, bytes) {} else |_| {}
+                copied.deinit(allocator);
+            } else |_| {
+                return -1;
+            }
+        }
+        let text_bytes = owned_text.as_bytes();
+        let att_bytes = owned_attachments.as_bytes();
+        let core = unsafe &var live.*;
+        if core.enqueue_turn(allocator, thread_id, text_bytes, att_bytes) |turn_id| {
+            return turn_id;
+        } else |_| {}
+    } else |_| {}
+    return -1;
+}
+
+export "c" fn kasugai_core_process_next_queued(handle: ?ptr<engine::Core>, thread_id: i64) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    if core.process_next_queued(mem::page_allocator(), thread_id) |done| {
+        return flag(done);
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_cancel_queued_turn(
+    handle: ?ptr<engine::Core>,
+    thread_id: i64,
+    turn_id: i64
+) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    return flag(core.cancel_queued_turn(mem::page_allocator(), thread_id, turn_id));
+}
+
+export "c" fn kasugai_core_resolve_approval(
+    handle: ?ptr<engine::Core>,
+    thread_id: i64,
+    approve: u8
+) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    if core.resolve_tool_approval(mem::page_allocator(), thread_id, approve != 0) |done| {
+        return flag(done);
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_cancel_active_turn(handle: ?ptr<engine::Core>, thread_id: i64) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    if core.cancel_active_turn(mem::page_allocator(), thread_id) |done| {
+        return flag(done);
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_poll_providers(handle: ?ptr<engine::Core>) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    if core.poll_providers(mem::page_allocator()) |changed| {
+        return flag(changed);
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_provider_wakeup_fds(handle: ?ptr<engine::Core>) -> ?ptr<u8> {
+    let live = handle orelse return null;
+    let allocator = mem::page_allocator();
+    let core = unsafe &live.*;
+    var out = string::new(allocator);
+    defer out.deinit(allocator);
+    if core.provider_wakeup_fds_json(allocator, &var out) {
+        let bytes = out.as_bytes();
+        return c_string_out(bytes);
+    } else |_| {}
+    return null;
+}
+
+export "c" fn kasugai_core_set_provider_command_override(
+    handle: ?ptr<engine::Core>,
+    provider_name: ?ptr<const u8>,
+    executable: ?ptr<const u8>,
+    args_nl: ?ptr<const u8>
+) -> u8 {
+    let live = handle orelse return 0;
+    let raw_provider = provider_name orelse return 0;
+    let allocator = mem::page_allocator();
+    var kind = provider::ProviderKind::LocalEcho;
+    if c_string(allocator, raw_provider) |copied| {
+        let bytes = copied.as_bytes();
+        let ok = provider::parse_provider(bytes, &var kind);
+        copied.deinit(allocator);
+        if !ok {
+            return 0;
+        }
+    } else |_| {
+        return 0;
+    }
+    var owned_exec = string::new(allocator);
+    defer owned_exec.deinit(allocator);
+    if executable |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if owned_exec.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return 0;
+        }
+    }
+    var owned_args = string::new(allocator);
+    defer owned_args.deinit(allocator);
+    if args_nl |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if owned_args.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return 0;
+        }
+    }
+    let exec_bytes = owned_exec.as_bytes();
+    let args_bytes = owned_args.as_bytes();
+    let core = unsafe &var live.*;
+    if core.set_provider_command_override(allocator, kind, exec_bytes, args_bytes) {
+        return 1;
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_set_telemetry_suppression(handle: ?ptr<engine::Core>, enabled: u8) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    core.set_telemetry_suppression(enabled != 0);
+    return 1;
+}
+
+export "c" fn kasugai_core_set_auto_approve_tools(handle: ?ptr<engine::Core>, enabled: u8) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    if core.set_auto_approve_tools(mem::page_allocator(), enabled != 0) |_| {
+        return 1;
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_set_orchestrator_bridge(
+    handle: ?ptr<engine::Core>,
+    socket_path: ?ptr<const u8>,
+    ctl_bin: ?ptr<const u8>
+) -> u8 {
+    let live = handle orelse return 0;
+    let allocator = mem::page_allocator();
+    var owned_sock = string::new(allocator);
+    defer owned_sock.deinit(allocator);
+    if socket_path |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if owned_sock.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return 0;
+        }
+    }
+    var owned_bin = string::new(allocator);
+    defer owned_bin.deinit(allocator);
+    if ctl_bin |raw| {
+        if c_string(allocator, raw) |copied| {
+            let bytes = copied.as_bytes();
+            if owned_bin.append_bytes(allocator, bytes) {} else |_| {}
+            copied.deinit(allocator);
+        } else |_| {
+            return 0;
+        }
+    }
+    let sock_bytes = owned_sock.as_bytes();
+    let bin_bytes = owned_bin.as_bytes();
+    let core = unsafe &var live.*;
+    if core.set_orchestrator_bridge(allocator, sock_bytes, bin_bytes) {
+        return 1;
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_bind_worktree(
+    handle: ?ptr<engine::Core>,
+    thread_id: i64,
+    branch: ?ptr<const u8>,
+    base_ref: ?ptr<const u8>,
+    worktree_path: ?ptr<const u8>
+) -> u8 {
+    let live = handle orelse return 0;
+    let raw_branch = branch orelse return 0;
+    let raw_path = worktree_path orelse return 0;
+    let allocator = mem::page_allocator();
+    if c_string(allocator, raw_branch) |owned_branch| {
+        defer owned_branch.deinit(allocator);
+        if c_string(allocator, raw_path) |owned_path| {
+            defer owned_path.deinit(allocator);
+            var owned_base = string::new(allocator);
+            defer owned_base.deinit(allocator);
+            if base_ref |raw_base| {
+                if c_string(allocator, raw_base) |copied| {
+                    let bytes = copied.as_bytes();
+                    if owned_base.append_bytes(allocator, bytes) {} else |_| {}
+                    copied.deinit(allocator);
+                } else |_| {
+                    return 0;
+                }
+            }
+            let branch_bytes = owned_branch.as_bytes();
+            let base_bytes = owned_base.as_bytes();
+            let path_bytes = owned_path.as_bytes();
+            let core = unsafe &var live.*;
+            if core.bind_worktree(allocator, thread_id, branch_bytes, base_bytes, path_bytes) |ok| {
+                return flag(ok);
+            } else |_| {}
+        } else |_| {}
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_reset_worktree(handle: ?ptr<engine::Core>, thread_id: i64) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    if core.reset_worktree(mem::page_allocator(), thread_id) |ok| {
+        return flag(ok);
+    } else |_| {}
+    return 0;
+}
+
+export "c" fn kasugai_core_update_diff_stats(
+    handle: ?ptr<engine::Core>,
+    thread_id: i64,
+    files_changed: i64,
+    insertions: i64,
+    deletions: i64
+) -> u8 {
+    let live = handle orelse return 0;
+    let core = unsafe &var live.*;
+    return flag(core.update_diff_stats(thread_id, files_changed, insertions, deletions));
+}
+
+export "c" fn kasugai_core_snapshot_json(handle: ?ptr<engine::Core>) -> ?ptr<u8> {
+    let live = handle orelse return null;
+    let allocator = mem::page_allocator();
+    let core = unsafe &live.*;
+    var json = string::new(allocator);
+    defer json.deinit(allocator);
+    if core.snapshot_json(allocator, &var json) {
+        let bytes = json.as_bytes();
+        return c_string_out(bytes);
+    } else |_| {}
+    return null;
+}
+
+export "c" fn kasugai_core_events_jsonl(handle: ?ptr<engine::Core>, thread_id: i64) -> ?ptr<u8> {
+    let live = handle orelse return null;
+    let allocator = mem::page_allocator();
+    let core = unsafe &live.*;
+    var out = string::new(allocator);
+    defer out.deinit(allocator);
+    if core.store.export_jsonl(allocator, thread_id, &var out) {
+        let bytes = out.as_bytes();
+        return c_string_out(bytes);
+    } else |_| {}
+    return null;
+}

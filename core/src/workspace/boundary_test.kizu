@@ -1,0 +1,35 @@
+import std::json;
+import std::mem;
+import std::string;
+import std::testing;
+
+test "workspace switches cleanly between project root and git worktree" {
+    let allocator = mem::page_allocator();
+    var binding = try new_root_binding(allocator, "/workspace/kasugai");
+    defer binding.deinit(allocator);
+
+    testing::expect(binding.mode == WorkspaceMode::ProjectRoot);
+    testing::expect(!try binding.bind_worktree(allocator, "   ", "main", "/tmp/wt"));
+    testing::expect(try binding.bind_worktree(allocator, "feat/acp", "origin/main", "/tmp/wt-acp"));
+    testing::expect(binding.mode == WorkspaceMode::GitWorktree);
+    binding.update_diff_stats(3, 42, 7);
+
+    var out = string::new(allocator);
+    defer out.deinit(allocator);
+    var encoder = json::encoder(allocator);
+    defer encoder.deinit(allocator);
+    try encoder.begin_object();
+    try write_workspace_json(&var encoder, &binding);
+    try encoder.end_object();
+    try encoder.finish_into(allocator, &var out);
+    let bytes = out.as_bytes();
+    let want =
+        \\{"mode":"git_worktree","root_path":"/workspace/kasugai","worktree_path":"/tmp/wt-acp","effective_cwd":"/tmp/wt-acp","branch":"feat/acp","base_ref":"origin/main","diff_files_changed":3,"diff_insertions":42,"diff_deletions":7}
+    ;
+    if !mem::equal_bytes(bytes, want) {
+        testing::fail(bytes);
+    }
+
+    binding.reset_to_root();
+    testing::expect(binding.mode == WorkspaceMode::ProjectRoot);
+}

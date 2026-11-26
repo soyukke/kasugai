@@ -1,0 +1,2622 @@
+import kasugai::event;
+import kasugai::provider;
+import kasugai::store;
+import kasugai::workspace;
+import std::array;
+import std::fmt;
+import std::json;
+import std::mem;
+import std::string;
+
+pub enum MessageRole {
+    User,
+    Assistant,
+    System,
+}
+
+pub fn role_name(role: MessageRole) -> []u8 {
+    if role == MessageRole::User {
+        return "user";
+    }
+    if role == MessageRole::Assistant {
+        return "assistant";
+    }
+    return "system";
+}
+
+pub struct Message {
+    pub id: i64,
+    pub turn_id: i64,
+    pub role: MessageRole,
+    pub text: string::String,
+    pub attachments: array::Array<string::String>,
+    pub provider: string::String,
+    pub model: string::String,
+}
+
+pub fn (self: Message) deinit(allocator: Allocator) -> void {
+    self.text.deinit(allocator);
+    self.attachments.deinit(allocator);
+    self.provider.deinit(allocator);
+    self.model.deinit(allocator);
+}
+
+pub struct QueuedTurn {
+    pub turn_id: i64,
+    pub text: string::String,
+    pub attachments: array::Array<string::String>,
+}
+
+pub fn (self: QueuedTurn) deinit(allocator: Allocator) -> void {
+    self.text.deinit(allocator);
+    self.attachments.deinit(allocator);
+}
+
+pub struct PendingApproval {
+    pub active: bool,
+    pub tool_name: string::String,
+    pub summary: string::String,
+}
+
+pub fn (self: PendingApproval) deinit(allocator: Allocator) -> void {
+    self.tool_name.deinit(allocator);
+    self.summary.deinit(allocator);
+}
+
+pub struct ThreadActivity {
+    pub turn_id: i64,
+    pub call_id: string::String,
+    pub kind: string::String,
+    pub title: string::String,
+    pub status: string::String,
+    pub detail: string::String,
+}
+
+pub fn (self: ThreadActivity) deinit(allocator: Allocator) -> void {
+    self.call_id.deinit(allocator);
+    self.kind.deinit(allocator);
+    self.title.deinit(allocator);
+    self.status.deinit(allocator);
+    self.detail.deinit(allocator);
+}
+
+pub struct Thread {
+    pub id: i64,
+    pub project_id: i64,
+    pub title: string::String,
+    pub updated_at_ms: i64,
+    pub machine_state: TurnMachineState,
+    pub provider: provider::ProviderKind,
+    pub model: string::String,
+    pub effort: provider::ReasoningEffort,
+    pub active_turn_id: i64,
+    pub streaming_text: string::String,
+    pub last_error: string::String,
+    pub provider_session_id: string::String,
+    pub available_models: array::Array<string::String>,
+    pub activities: array::Array<ThreadActivity>,
+    pub pending_approval: PendingApproval,
+    pub workspace: workspace::WorkspaceBinding,
+    pub messages: array::Array<Message>,
+    pub queue: array::Array<QueuedTurn>,
+}
+
+pub fn (self: Thread) deinit(allocator: Allocator) -> void {
+    self.title.deinit(allocator);
+    self.model.deinit(allocator);
+    self.streaming_text.deinit(allocator);
+    self.last_error.deinit(allocator);
+    self.provider_session_id.deinit(allocator);
+    self.available_models.deinit(allocator);
+    self.activities.deinit(allocator);
+    self.pending_approval.deinit(allocator);
+    self.workspace.deinit(allocator);
+    self.messages.deinit(allocator);
+    self.queue.deinit(allocator);
+}
+
+pub struct Project {
+    pub id: i64,
+    pub name: string::String,
+    pub root_path: string::String,
+}
+
+pub fn (self: Project) deinit(allocator: Allocator) -> void {
+    self.name.deinit(allocator);
+    self.root_path.deinit(allocator);
+}
+
+pub struct Core {
+    pub projects: array::Array<Project>,
+    pub threads: array::Array<Thread>,
+    pub sessions: array::Array<provider::ProviderSession>,
+    pub command_overrides: array::Array<provider::CommandOverride>,
+    pub bridge_socket: string::String,
+    pub bridge_bin: string::String,
+    pub active_project_id: i64,
+    pub active_thread_id: i64,
+    pub next_project_id: i64,
+    pub next_thread_id: i64,
+    pub next_message_id: i64,
+    pub next_turn_id: i64,
+    pub suppress_telemetry: bool,
+    pub auto_approve_tools: bool,
+    pub store: store::EventStore,
+}
+
+pub fn (self: Core) deinit(allocator: Allocator) -> void {
+    self.sessions.deinit(allocator);
+    self.command_overrides.deinit(allocator);
+    self.bridge_socket.deinit(allocator);
+    self.bridge_bin.deinit(allocator);
+    self.projects.deinit(allocator);
+    self.threads.deinit(allocator);
+    self.store.deinit(allocator);
+}
+
+fn is_blank(bytes: []u8) -> bool {
+    var index = 0;
+    while index < mem::len(bytes) {
+        let byte = bytes[index];
+        if byte != cast<u8>(32) and byte != cast<u8>(9) and byte != cast<u8>(10) and
+            byte != cast<u8>(13) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+fn parse_attachments(allocator: Allocator, raw: []u8) -> mem::Error!array::Array<string::String> {
+    var list = array::new<string::String>(allocator);
+    errdefer list.deinit(allocator);
+    var start: i64 = 0;
+    let total = mem::len(raw);
+    while start < total {
+        var end = start;
+        while end < total and raw[end] != cast<u8>(10) {
+            end = end + 1;
+        }
+        var line_end = end;
+        if line_end > start and raw[line_end - 1] == cast<u8>(13) {
+            line_end = line_end - 1;
+        }
+        if line_end > start {
+            let segment = raw[start..line_end];
+            if !is_blank(segment) {
+                var entry = try string::from_bytes(allocator, segment);
+                errdefer entry.deinit(allocator);
+                string::trim_space_in_place(&var entry);
+                if entry.len() > 0 {
+                    try list.append(allocator, move entry);
+                } else {
+                    entry.deinit(allocator);
+                }
+            }
+        }
+        start = end + 1;
+    }
+    return move list;
+}
+
+fn replace_string_array(
+    allocator: Allocator,
+    dst: &var array::Array<string::String>,
+    src: &array::Array<string::String>
+) -> mem::Error!void {
+    dst.clear(allocator);
+    var index = 0;
+    while src.at(index) |item| {
+        let bytes = item.as_bytes();
+        var copy = try string::from_bytes(allocator, bytes);
+        errdefer copy.deinit(allocator);
+        try dst.append(allocator, move copy);
+        index = index + 1;
+    }
+    return;
+}
+
+fn clone_string_array(
+    allocator: Allocator,
+    items: &array::Array<string::String>
+) -> mem::Error!array::Array<string::String> {
+    var out = array::new<string::String>(allocator);
+    errdefer out.deinit(allocator);
+    var index = 0;
+    while items.at(index) |item| {
+        let bytes = item.as_bytes();
+        let copy = try string::from_bytes(allocator, bytes);
+        try out.append(allocator, move copy);
+        index = index + 1;
+    }
+    return move out;
+}
+
+fn join_attachments(
+    allocator: Allocator,
+    items: &array::Array<string::String>,
+    out: &var string::String
+) -> mem::Error!void {
+    var index = 0;
+    while items.at(index) |item| {
+        if index > 0 {
+            try out.append_byte(allocator, 10);
+        }
+        let bytes = item.as_bytes();
+        try out.append_bytes(allocator, bytes);
+        index = index + 1;
+    }
+    return;
+}
+
+fn build_empty_core(allocator: Allocator) -> Core {
+    return Core {
+        projects: array::new<Project>(allocator),
+        threads: array::new<Thread>(allocator),
+        sessions: array::new<provider::ProviderSession>(allocator),
+        command_overrides: array::new<provider::CommandOverride>(allocator),
+        bridge_socket: string::new(allocator),
+        bridge_bin: string::new(allocator),
+        active_project_id: 0,
+        active_thread_id: 0,
+        next_project_id: 1,
+        next_thread_id: 1,
+        next_message_id: 1,
+        next_turn_id: 1,
+        suppress_telemetry: true,
+        auto_approve_tools: false,
+        store: store::new_memory_store(allocator)
+    };
+}
+
+fn (self: &Core) project_index(project_id: i64) -> i64 {
+    var index = 0;
+    while self.projects.at(index) |project| {
+        if project.id == project_id {
+            return index;
+        }
+        index = index + 1;
+    }
+    return -1;
+}
+
+fn (self: &Core) thread_index(thread_id: i64) -> i64 {
+    var index = 0;
+    while self.threads.at(index) |thread| {
+        if thread.id == thread_id {
+            return index;
+        }
+        index = index + 1;
+    }
+    return -1;
+}
+
+fn (self: &Core) session_index(thread_id: i64) -> i64 {
+    var index = 0;
+    while self.sessions.at(index) |session| {
+        if session.thread_id == thread_id {
+            return index;
+        }
+        index = index + 1;
+    }
+    return -1;
+}
+
+fn (self: &var Core) disconnect_session(allocator: Allocator, thread_id: i64) -> void {
+    let idx = self.session_index(thread_id);
+    if idx >= 0 {
+        if self.sessions.at_mut(idx) |session| {
+            session.disconnect(allocator);
+        }
+    }
+    return;
+}
+
+fn replay_parse_provider(value: &string::String) -> provider::ProviderKind {
+    var kind = provider::ProviderKind::LocalEcho;
+    let bytes = value.as_bytes();
+    let _ = provider::parse_provider(bytes, &var kind);
+    return kind;
+}
+
+fn replay_parse_effort(value: &string::String) -> provider::ReasoningEffort {
+    var effort = provider::ReasoningEffort::Medium;
+    let bytes = value.as_bytes();
+    let _ = provider::parse_effort(bytes, &var effort);
+    return effort;
+}
+
+fn replay_bind_worktree(
+    allocator: Allocator,
+    ws: &var workspace::WorkspaceBinding,
+    branch: &string::String,
+    worktree_path: &string::String
+) -> mem::Error!void {
+    let branch_bytes = branch.as_bytes();
+    let path_bytes = worktree_path.as_bytes();
+    if is_blank(branch_bytes) or is_blank(path_bytes) {
+        ws.reset_to_root();
+        return;
+    }
+    let _ = try ws.bind_worktree(allocator, branch_bytes, "", path_bytes);
+    return;
+}
+
+fn replay_user_message(
+    allocator: Allocator,
+    id: i64,
+    item: &event::UnifiedEvent
+) -> mem::Error!Message {
+    var text_copy = string::new(allocator);
+    errdefer text_copy.deinit(allocator);
+    try text_copy.append_string(allocator, &item.text);
+    let detail_bytes = item.detail.as_bytes();
+    var attachments = try parse_attachments(allocator, detail_bytes);
+    errdefer attachments.deinit(allocator);
+    var provider_copy = string::new(allocator);
+    errdefer provider_copy.deinit(allocator);
+    try provider_copy.append_string(allocator, &item.provider);
+    var model_copy = string::new(allocator);
+    errdefer model_copy.deinit(allocator);
+    try model_copy.append_string(allocator, &item.model);
+    return Message {
+        id: id,
+        turn_id: item.turn_id,
+        role: MessageRole::User,
+        text: move text_copy,
+        attachments: move attachments,
+        provider: move provider_copy,
+        model: move model_copy
+    };
+}
+
+fn replay_assistant_message(
+    allocator: Allocator,
+    id: i64,
+    item: &event::UnifiedEvent
+) -> mem::Error!Message {
+    var text_copy = string::new(allocator);
+    errdefer text_copy.deinit(allocator);
+    try text_copy.append_string(allocator, &item.text);
+    var provider_copy = string::new(allocator);
+    errdefer provider_copy.deinit(allocator);
+    try provider_copy.append_string(allocator, &item.provider);
+    var model_copy = string::new(allocator);
+    errdefer model_copy.deinit(allocator);
+    try model_copy.append_string(allocator, &item.model);
+    return Message {
+        id: id,
+        turn_id: item.turn_id,
+        role: MessageRole::Assistant,
+        text: move text_copy,
+        attachments: array::new<string::String>(allocator),
+        provider: move provider_copy,
+        model: move model_copy
+    };
+}
+
+fn apply_replayed_event(
+    allocator: Allocator,
+    core: &var Core,
+    item: &event::UnifiedEvent
+) -> mem::Error!void {
+    if item.project_id >= core.next_project_id {
+        core.next_project_id = item.project_id + 1;
+    }
+    if item.thread_id >= core.next_thread_id {
+        core.next_thread_id = item.thread_id + 1;
+    }
+    if item.turn_id >= core.next_turn_id {
+        core.next_turn_id = item.turn_id + 1;
+    }
+
+    if item.kind == event::EventKind::ProjectCreated {
+        if core.project_index(item.project_id) < 0 {
+            var name = string::new(allocator);
+            errdefer name.deinit(allocator);
+            try name.append_string(allocator, &item.text);
+            var root_path = string::new(allocator);
+            errdefer root_path.deinit(allocator);
+            try root_path.append_string(allocator, &item.detail);
+            let proj = Project { id: item.project_id, name: move name, root_path: move root_path };
+            try core.projects.append(allocator, move proj);
+            core.active_project_id = item.project_id;
+        }
+        return;
+    }
+    if item.kind == event::EventKind::ThreadCreated {
+        if core.thread_index(item.thread_id) < 0 {
+            let kind = replay_parse_provider(&item.provider);
+            let effort = replay_parse_effort(&item.effort);
+            var title = string::new(allocator);
+            errdefer title.deinit(allocator);
+            try title.append_string(allocator, &item.text);
+            var model = string::new(allocator);
+            errdefer model.deinit(allocator);
+            try model.append_string(allocator, &item.model);
+            var ws = try new_binding_from_string(allocator, &item.detail);
+            errdefer ws.deinit(allocator);
+            let thread = Thread {
+                id: item.thread_id,
+                project_id: item.project_id,
+                title: move title,
+                updated_at_ms: item.timestamp_ms,
+                machine_state: TurnMachineState::IdleEmpty,
+                provider: kind,
+                model: move model,
+                effort: effort,
+                active_turn_id: 0,
+                streaming_text: string::new(allocator),
+                last_error: string::new(allocator),
+                provider_session_id: string::new(allocator),
+                available_models: array::new<string::String>(allocator),
+                activities: array::new<ThreadActivity>(allocator),
+                pending_approval: PendingApproval {
+                    active: false,
+                    tool_name: string::new(allocator),
+                    summary: string::new(allocator)
+                },
+                workspace: move ws,
+                messages: array::new<Message>(allocator),
+                queue: array::new<QueuedTurn>(allocator)
+            };
+            try core.threads.append(allocator, move thread);
+            core.active_project_id = item.project_id;
+            core.active_thread_id = item.thread_id;
+        }
+        return;
+    }
+
+    let t_idx = core.thread_index(item.thread_id);
+    if t_idx < 0 {
+        return;
+    }
+    if core.threads.at_mut(t_idx) |thread| {
+        if item.timestamp_ms > thread.updated_at_ms {
+            thread.updated_at_ms = item.timestamp_ms;
+        }
+    }
+    if item.kind == event::EventKind::ThreadRenamed {
+        if core.threads.at_mut(t_idx) |thread| {
+            thread.title.clear();
+            try thread.title.append_string(allocator, &item.text);
+        }
+        return;
+    }
+    if item.kind == event::EventKind::ProviderChanged {
+        let kind = replay_parse_provider(&item.provider);
+        let effort = replay_parse_effort(&item.effort);
+        if core.threads.at_mut(t_idx) |thread| {
+            if thread.provider != kind {
+                thread.provider_session_id.clear();
+            }
+            thread.provider = kind;
+            thread.effort = effort;
+            thread.model.clear();
+            try thread.model.append_string(allocator, &item.model);
+            if item.detail.len() > 0 {
+                thread.provider_session_id.clear();
+                try thread.provider_session_id.append_string(allocator, &item.detail);
+            }
+        }
+        return;
+    }
+    if item.kind == event::EventKind::WorkspaceUpdated {
+        if core.threads.at_mut(t_idx) |thread| {
+            try replay_bind_worktree(allocator, &var thread.workspace, &item.text, &item.detail);
+        }
+        return;
+    }
+    if item.kind == event::EventKind::MessageUser {
+        let msg_id = core.next_message_id;
+        core.next_message_id = core.next_message_id + 1;
+        let msg = try replay_user_message(allocator, msg_id, item);
+        if core.threads.at_mut(t_idx) |thread| {
+            try thread.messages.append(allocator, move msg);
+        } else {
+            msg.deinit(allocator);
+        }
+        return;
+    }
+    if item.kind == event::EventKind::MessageCompleted {
+        let msg_id = core.next_message_id;
+        core.next_message_id = core.next_message_id + 1;
+        let msg = try replay_assistant_message(allocator, msg_id, item);
+        if core.threads.at_mut(t_idx) |thread| {
+            try thread.messages.append(allocator, move msg);
+            thread.last_error.clear();
+            thread.machine_state = TurnMachineState::IdleEmpty;
+        } else {
+            msg.deinit(allocator);
+        }
+        return;
+    }
+    if item.kind == event::EventKind::TurnCompleted {
+        if core.threads.at_mut(t_idx) |thread| {
+            thread.last_error.clear();
+            thread.machine_state = TurnMachineState::IdleEmpty;
+        }
+        return;
+    }
+    if item.kind == event::EventKind::TurnFailed {
+        if core.threads.at_mut(t_idx) |thread| {
+            thread.last_error.clear();
+            try thread.last_error.append_string(allocator, &item.detail);
+            thread.machine_state = TurnMachineState::FailedEmpty;
+        }
+        return;
+    }
+    return;
+}
+
+pub fn new_core_with_store(
+    allocator: Allocator,
+    project_name: []u8,
+    project_path: []u8,
+    store_path: []u8
+) -> mem::Error!Core {
+    var core = build_empty_core(allocator);
+    errdefer core.deinit(allocator);
+
+    if !is_blank(store_path) {
+        var raw = string::new(allocator);
+        defer raw.deinit(allocator);
+        if try store::read_file_bytes(allocator, store_path, &var raw) {
+            var loaded = array::new<event::UnifiedEvent>(allocator);
+            defer loaded.deinit(allocator);
+            let raw_bytes = raw.as_bytes();
+            let _ = try store::parse_jsonl_tolerant(allocator, raw_bytes, &var loaded);
+            while loaded.len() > 0 {
+                if loaded.remove(0) |ev| {
+                    var ev_owned = move ev;
+                    errdefer ev_owned.deinit(allocator);
+                    try apply_replayed_event(allocator, &var core, &ev_owned);
+                    try core.store.append_replayed(allocator, move ev_owned);
+                } else |_| {
+                    break;
+                }
+            }
+        }
+        try core.store.attach_path(allocator, store_path);
+    }
+
+    if core.projects.len() == 0 {
+        var initial_name = project_name;
+        if is_blank(initial_name) {
+            initial_name = "Kasugai";
+        }
+        var initial_path = project_path;
+        if is_blank(initial_path) {
+            initial_path = ".";
+        }
+        let project_id = try core.add_project(allocator, initial_name, initial_path);
+        let _ = try core.create_thread(
+            allocator,
+            project_id,
+            "スレッド 1",
+            provider::ProviderKind::LocalEcho,
+            provider::provider_default_model(provider::ProviderKind::LocalEcho),
+            provider::ReasoningEffort::Medium
+        );
+    }
+    return move core;
+}
+
+pub fn new_core(allocator: Allocator, project_name: []u8, project_path: []u8) -> mem::Error!Core {
+    return new_core_with_store(allocator, project_name, project_path, "");
+}
+
+fn record_project_created(
+    allocator: Allocator,
+    event_store: &var store::EventStore,
+    project_id: i64,
+    name: &string::String,
+    root_path: &string::String
+) -> mem::Error!void {
+    let name_bytes = name.as_bytes();
+    let path_bytes = root_path.as_bytes();
+    let _ = try event_store.record(
+        allocator,
+        project_id,
+        0,
+        0,
+        event::EventKind::ProjectCreated,
+        "",
+        "",
+        "",
+        name_bytes,
+        path_bytes
+    );
+    return;
+}
+
+fn record_thread_created(
+    allocator: Allocator,
+    event_store: &var store::EventStore,
+    project_id: i64,
+    thread_id: i64,
+    kind: provider::ProviderKind,
+    effort: provider::ReasoningEffort,
+    title: &string::String,
+    model: &string::String,
+    root_path: &string::String
+) -> mem::Error!void {
+    let title_bytes = title.as_bytes();
+    let model_bytes = model.as_bytes();
+    let root_bytes = root_path.as_bytes();
+    let _ = try event_store.record(
+        allocator,
+        project_id,
+        thread_id,
+        0,
+        event::EventKind::ThreadCreated,
+        provider::provider_id(kind),
+        model_bytes,
+        provider::effort_id(effort),
+        title_bytes,
+        root_bytes
+    );
+    return;
+}
+
+fn new_binding_from_string(
+    allocator: Allocator,
+    root_path: &string::String
+) -> mem::Error!workspace::WorkspaceBinding {
+    let bytes = root_path.as_bytes();
+    return workspace::new_root_binding(allocator, bytes);
+}
+
+pub fn (self: &var Core) set_orchestrator_bridge(
+    allocator: Allocator,
+    socket_path: []u8,
+    ctl_bin: []u8
+) -> mem::Error!void {
+    self.bridge_socket.clear();
+    if !is_blank(socket_path) {
+        try self.bridge_socket.append_bytes(allocator, socket_path);
+    }
+    self.bridge_bin.clear();
+    if !is_blank(ctl_bin) {
+        try self.bridge_bin.append_bytes(allocator, ctl_bin);
+    }
+    return;
+}
+
+pub fn (self: &var Core) set_provider_command_override(
+    allocator: Allocator,
+    kind: provider::ProviderKind,
+    executable: []u8,
+    args_nl: []u8
+) -> mem::Error!void {
+    var found: i64 = -1;
+    var idx: i64 = 0;
+    while self.command_overrides.at(idx) |ov| {
+        if ov.kind == kind {
+            found = idx;
+            break;
+        }
+        idx = idx + 1;
+    }
+    if found >= 0 {
+        if self.command_overrides.remove(found) |old| {
+            old.deinit(allocator);
+        } else |_| {}
+    }
+    if is_blank(executable) {
+        return;
+    }
+    let entry = try provider::new_command_override(allocator, kind, executable, args_nl);
+    return self.command_overrides.append(allocator, move entry);
+}
+
+pub fn (self: &var Core) add_project(
+    allocator: Allocator,
+    name: []u8,
+    root_path: []u8
+) -> mem::Error!i64 {
+    if is_blank(name) or is_blank(root_path) {
+        return -1;
+    }
+    let id = self.next_project_id;
+    self.next_project_id = self.next_project_id + 1;
+
+    var owned_name = try string::from_bytes(allocator, name);
+    errdefer owned_name.deinit(allocator);
+    string::trim_space_in_place(&var owned_name);
+
+    var owned_path = try string::from_bytes(allocator, root_path);
+    errdefer owned_path.deinit(allocator);
+    string::trim_space_in_place(&var owned_path);
+
+    try record_project_created(allocator, &var self.store, id, &owned_name, &owned_path);
+
+    let project = Project {
+        id: id,
+        name: move owned_name,
+        root_path: move owned_path
+    };
+    try self.projects.append(allocator, move project);
+    self.active_project_id = id;
+    return id;
+}
+
+pub fn (self: &var Core) select_project(project_id: i64) -> bool {
+    if self.project_index(project_id) < 0 {
+        return false;
+    }
+    self.active_project_id = project_id;
+    var index = 0;
+    while self.threads.at(index) |thread| {
+        if thread.project_id == project_id {
+            self.active_thread_id = thread.id;
+            return true;
+        }
+        index = index + 1;
+    }
+    return true;
+}
+
+pub fn (self: &var Core) create_thread(
+    allocator: Allocator,
+    project_id: i64,
+    title: []u8,
+    kind: provider::ProviderKind,
+    model: []u8,
+    effort: provider::ReasoningEffort
+) -> mem::Error!i64 {
+    let p_index = self.project_index(project_id);
+    if p_index < 0 {
+        return -1;
+    }
+    var root_copy = string::new(allocator);
+    defer root_copy.deinit(allocator);
+    if self.projects.at(p_index) |project| {
+        try root_copy.append_string(allocator, &project.root_path);
+    }
+
+    let id = self.next_thread_id;
+    self.next_thread_id = self.next_thread_id + 1;
+
+    var owned_title = string::new(allocator);
+    errdefer owned_title.deinit(allocator);
+    if is_blank(title) {
+        try owned_title.append_bytes(allocator, "スレッド ");
+        try fmt::append_i64(allocator, &var owned_title, id);
+    } else {
+        try owned_title.append_bytes(allocator, title);
+        string::trim_space_in_place(&var owned_title);
+    }
+
+    var owned_model = string::new(allocator);
+    errdefer owned_model.deinit(allocator);
+    if is_blank(model) {
+        try owned_model.append_bytes(allocator, provider::provider_default_model(kind));
+    } else {
+        try owned_model.append_bytes(allocator, model);
+        string::trim_space_in_place(&var owned_model);
+    }
+
+    var ws = try new_binding_from_string(allocator, &root_copy);
+    errdefer ws.deinit(allocator);
+
+    try record_thread_created(
+        allocator,
+        &var self.store,
+        project_id,
+        id,
+        kind,
+        effort,
+        &owned_title,
+        &owned_model,
+        &root_copy
+    );
+
+    let thread = Thread {
+        id: id,
+        project_id: project_id,
+        title: move owned_title,
+        updated_at_ms: store::unix_millis(),
+        machine_state: TurnMachineState::IdleEmpty,
+        provider: kind,
+        model: move owned_model,
+        effort: effort,
+        active_turn_id: 0,
+        streaming_text: string::new(allocator),
+        last_error: string::new(allocator),
+        provider_session_id: string::new(allocator),
+        available_models: array::new<string::String>(allocator),
+        activities: array::new<ThreadActivity>(allocator),
+        pending_approval: PendingApproval {
+            active: false,
+            tool_name: string::new(allocator),
+            summary: string::new(allocator)
+        },
+        workspace: move ws,
+        messages: array::new<Message>(allocator),
+        queue: array::new<QueuedTurn>(allocator)
+    };
+    try self.threads.append(allocator, move thread);
+    self.active_project_id = project_id;
+    self.active_thread_id = id;
+    return id;
+}
+
+pub fn (self: &var Core) select_thread(thread_id: i64) -> bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    if self.threads.at(index) |thread| {
+        self.active_project_id = thread.project_id;
+        self.active_thread_id = thread.id;
+        return true;
+    }
+    return false;
+}
+
+pub fn (self: &var Core) rename_thread(
+    allocator: Allocator,
+    thread_id: i64,
+    title: []u8
+) -> mem::Error!bool {
+    if is_blank(title) {
+        return false;
+    }
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var project_id: i64 = 0;
+    var kind = provider::ProviderKind::LocalEcho;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    var title_copy = string::new(allocator);
+    defer title_copy.deinit(allocator);
+    var empty_detail = string::new(allocator);
+    defer empty_detail.deinit(allocator);
+
+    if self.threads.at_mut(index) |thread| {
+        thread.title.clear();
+        try thread.title.append_bytes(allocator, title);
+        string::trim_space_in_place(&var thread.title);
+        thread.updated_at_ms = store::unix_millis();
+        project_id = thread.project_id;
+        kind = thread.provider;
+        effort = thread.effort;
+        try model_copy.append_string(allocator, &thread.model);
+        try title_copy.append_string(allocator, &thread.title);
+    } else {
+        return false;
+    }
+    try record_event_strings(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        0,
+        event::EventKind::ThreadRenamed,
+        kind,
+        &model_copy,
+        effort,
+        &title_copy,
+        &empty_detail
+    );
+    return true;
+}
+
+fn record_event_with_model(
+    allocator: Allocator,
+    event_store: &var store::EventStore,
+    project_id: i64,
+    thread_id: i64,
+    turn_id: i64,
+    kind: event::EventKind,
+    provider_kind: provider::ProviderKind,
+    model: &string::String,
+    effort: provider::ReasoningEffort,
+    text: []u8,
+    detail: []u8
+) -> mem::Error!void {
+    let model_bytes = model.as_bytes();
+    let _ = try event_store.record(
+        allocator,
+        project_id,
+        thread_id,
+        turn_id,
+        kind,
+        provider::provider_id(provider_kind),
+        model_bytes,
+        provider::effort_id(effort),
+        text,
+        detail
+    );
+    return;
+}
+
+fn record_event_strings(
+    allocator: Allocator,
+    event_store: &var store::EventStore,
+    project_id: i64,
+    thread_id: i64,
+    turn_id: i64,
+    kind: event::EventKind,
+    provider_kind: provider::ProviderKind,
+    model: &string::String,
+    effort: provider::ReasoningEffort,
+    text: &string::String,
+    detail: &string::String
+) -> mem::Error!void {
+    let model_bytes = model.as_bytes();
+    let text_bytes = text.as_bytes();
+    let detail_bytes = detail.as_bytes();
+    let _ = try event_store.record(
+        allocator,
+        project_id,
+        thread_id,
+        turn_id,
+        kind,
+        provider::provider_id(provider_kind),
+        model_bytes,
+        provider::effort_id(effort),
+        text_bytes,
+        detail_bytes
+    );
+    return;
+}
+
+fn record_event_with_detail_string(
+    allocator: Allocator,
+    event_store: &var store::EventStore,
+    project_id: i64,
+    thread_id: i64,
+    turn_id: i64,
+    kind: event::EventKind,
+    provider_kind: provider::ProviderKind,
+    model: &string::String,
+    effort: provider::ReasoningEffort,
+    text: []u8,
+    detail: &string::String
+) -> mem::Error!void {
+    let model_bytes = model.as_bytes();
+    let detail_bytes = detail.as_bytes();
+    let _ = try event_store.record(
+        allocator,
+        project_id,
+        thread_id,
+        turn_id,
+        kind,
+        provider::provider_id(provider_kind),
+        model_bytes,
+        provider::effort_id(effort),
+        text,
+        detail_bytes
+    );
+    return;
+}
+
+fn build_user_message(
+    allocator: Allocator,
+    id: i64,
+    turn_id: i64,
+    queued: &QueuedTurn,
+    provider_kind: provider::ProviderKind,
+    model: &string::String
+) -> mem::Error!Message {
+    var msg_text = string::new(allocator);
+    errdefer msg_text.deinit(allocator);
+    try msg_text.append_string(allocator, &queued.text);
+    var msg_attachments = try clone_string_array(allocator, &queued.attachments);
+    errdefer msg_attachments.deinit(allocator);
+    var msg_provider = try string::from_bytes(allocator, provider::provider_id(provider_kind));
+    errdefer msg_provider.deinit(allocator);
+    var msg_model = string::new(allocator);
+    errdefer msg_model.deinit(allocator);
+    try msg_model.append_string(allocator, model);
+    return Message {
+        id: id,
+        turn_id: turn_id,
+        role: MessageRole::User,
+        text: move msg_text,
+        attachments: move msg_attachments,
+        provider: move msg_provider,
+        model: move msg_model
+    };
+}
+
+fn build_assistant_message(
+    allocator: Allocator,
+    id: i64,
+    turn_id: i64,
+    text: &string::String,
+    provider_kind: provider::ProviderKind,
+    model: &string::String
+) -> mem::Error!Message {
+    var msg_text = string::new(allocator);
+    errdefer msg_text.deinit(allocator);
+    try msg_text.append_string(allocator, text);
+    var msg_provider = try string::from_bytes(allocator, provider::provider_id(provider_kind));
+    errdefer msg_provider.deinit(allocator);
+    var msg_model = string::new(allocator);
+    errdefer msg_model.deinit(allocator);
+    try msg_model.append_string(allocator, model);
+    return Message {
+        id: id,
+        turn_id: turn_id,
+        role: MessageRole::Assistant,
+        text: move msg_text,
+        attachments: array::new<string::String>(allocator),
+        provider: move msg_provider,
+        model: move msg_model
+    };
+}
+
+fn run_local_turn_strings(
+    allocator: Allocator,
+    kind: provider::ProviderKind,
+    model: &string::String,
+    effort: provider::ReasoningEffort,
+    prompt: &string::String,
+    attachment_count: i64,
+    suppress_telemetry: bool
+) -> mem::Error!provider::LocalTurnOutput {
+    let model_bytes = model.as_bytes();
+    let prompt_bytes = prompt.as_bytes();
+    return provider::execute_local_turn(
+        allocator,
+        kind,
+        model_bytes,
+        effort,
+        prompt_bytes,
+        attachment_count,
+        suppress_telemetry
+    );
+}
+
+fn append_delta_string(
+    allocator: Allocator,
+    core: &var Core,
+    thread_id: i64,
+    chunk: &string::String
+) -> mem::Error!bool {
+    let bytes = chunk.as_bytes();
+    return core.append_active_delta(allocator, thread_id, bytes);
+}
+
+fn finish_turn_string(
+    allocator: Allocator,
+    core: &var Core,
+    thread_id: i64,
+    text: &string::String
+) -> mem::Error!bool {
+    let bytes = text.as_bytes();
+    return core.finish_active_turn(allocator, thread_id, bytes);
+}
+
+fn fail_turn_string(
+    allocator: Allocator,
+    core: &var Core,
+    thread_id: i64,
+    reason: &string::String
+) -> mem::Error!bool {
+    let bytes = reason.as_bytes();
+    return core.fail_active_turn(allocator, thread_id, bytes);
+}
+
+fn request_approval_strings(
+    allocator: Allocator,
+    core: &var Core,
+    thread_id: i64,
+    tool_name: &string::String,
+    summary: &string::String
+) -> mem::Error!bool {
+    let tool_bytes = tool_name.as_bytes();
+    let sum_bytes = summary.as_bytes();
+    return core.request_tool_approval(allocator, thread_id, tool_bytes, sum_bytes);
+}
+
+pub fn (self: &var Core) set_thread_provider(
+    allocator: Allocator,
+    thread_id: i64,
+    kind: provider::ProviderKind,
+    model: []u8,
+    effort: provider::ReasoningEffort
+) -> mem::Error!bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var project_id: i64 = 0;
+    var provider_changed = false;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    if self.threads.at_mut(index) |thread| {
+        if thread.provider != kind {
+            provider_changed = true;
+            thread.provider_session_id.clear();
+            thread.available_models.clear(allocator);
+        }
+        thread.provider = kind;
+        thread.effort = effort;
+        thread.model.clear();
+        if is_blank(model) or (provider_changed and mem::equal_bytes(model, "local-echo")) {
+            try thread.model.append_bytes(allocator, provider::provider_default_model(kind));
+        } else {
+            try thread.model.append_bytes(allocator, model);
+            string::trim_space_in_place(&var thread.model);
+        }
+        project_id = thread.project_id;
+        try model_copy.append_string(allocator, &thread.model);
+    } else {
+        return false;
+    }
+    if provider_changed {
+        self.disconnect_session(allocator, thread_id);
+    }
+    try record_event_with_model(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        0,
+        event::EventKind::ProviderChanged,
+        kind,
+        &model_copy,
+        effort,
+        provider::provider_display_name(kind),
+        ""
+    );
+    return true;
+}
+
+pub fn (self: &var Core) set_telemetry_suppression(enabled: bool) -> void {
+    self.suppress_telemetry = enabled;
+    return;
+}
+
+pub fn (self: &var Core) set_auto_approve_tools(
+    allocator: Allocator,
+    enabled: bool
+) -> mem::Error!bool {
+    var changed = self.auto_approve_tools != enabled;
+    self.auto_approve_tools = enabled;
+    if !enabled {
+        return changed;
+    }
+    var pending_ids = array::new<i64>(allocator);
+    defer pending_ids.deinit(allocator);
+    var idx: i64 = 0;
+    while self.threads.at(idx) |thread| {
+        if thread.machine_state == TurnMachineState::AwaitingApprovalEmpty or
+            thread.machine_state == TurnMachineState::AwaitingApprovalQueued {
+            try pending_ids.append(allocator, thread.id);
+        }
+        idx = idx + 1;
+    }
+    while pending_ids.len() > 0 {
+        if pending_ids.remove(0) |tid| {
+            if try self.resolve_tool_approval(allocator, tid, true) {
+                changed = true;
+            }
+        } else |_| {
+            break;
+        }
+    }
+    return changed;
+}
+
+pub fn (self: &var Core) bind_worktree(
+    allocator: Allocator,
+    thread_id: i64,
+    branch: []u8,
+    base_ref: []u8,
+    worktree_path: []u8
+) -> mem::Error!bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var project_id: i64 = 0;
+    var updated = false;
+    if self.threads.at_mut(index) |thread| {
+        updated = try thread.workspace.bind_worktree(allocator, branch, base_ref, worktree_path);
+        project_id = thread.project_id;
+    }
+    if !updated {
+        return false;
+    }
+    self.disconnect_session(allocator, thread_id);
+    let _ = try self.store.record(
+        allocator,
+        project_id,
+        thread_id,
+        0,
+        event::EventKind::WorkspaceUpdated,
+        "",
+        "",
+        "",
+        branch,
+        worktree_path
+    );
+    return true;
+}
+
+pub fn (self: &var Core) reset_worktree(allocator: Allocator, thread_id: i64) -> mem::Error!bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var project_id: i64 = 0;
+    if self.threads.at_mut(index) |thread| {
+        thread.workspace.reset_to_root();
+        project_id = thread.project_id;
+    }
+    self.disconnect_session(allocator, thread_id);
+    let _ = try self.store.record(
+        allocator,
+        project_id,
+        thread_id,
+        0,
+        event::EventKind::WorkspaceUpdated,
+        "",
+        "",
+        "",
+        "",
+        ""
+    );
+    return true;
+}
+
+pub fn (self: &var Core) update_diff_stats(
+    thread_id: i64,
+    files_changed: i64,
+    insertions: i64,
+    deletions: i64
+) -> bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    if self.threads.at_mut(index) |thread| {
+        thread.workspace.update_diff_stats(files_changed, insertions, deletions);
+        return true;
+    }
+    return false;
+}
+
+pub fn (self: &var Core) enqueue_turn(
+    allocator: Allocator,
+    thread_id: i64,
+    text: []u8,
+    attachments_nl: []u8
+) -> mem::Error!i64 {
+    if is_blank(text) {
+        return -1;
+    }
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return -1;
+    }
+    var owned_text = try string::from_bytes(allocator, text);
+    errdefer owned_text.deinit(allocator);
+    string::trim_space_in_place(&var owned_text);
+    if owned_text.len() == 0 {
+        owned_text.deinit(allocator);
+        return -1;
+    }
+    var attachments = try parse_attachments(allocator, attachments_nl);
+    errdefer attachments.deinit(allocator);
+
+    let turn_id = self.next_turn_id;
+    self.next_turn_id = self.next_turn_id + 1;
+
+    var project_id: i64 = 0;
+    var kind = provider::ProviderKind::LocalEcho;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    var detail = string::new(allocator);
+    defer detail.deinit(allocator);
+    try join_attachments(allocator, &attachments, &var detail);
+    var text_copy = string::new(allocator);
+    defer text_copy.deinit(allocator);
+    try text_copy.append_string(allocator, &owned_text);
+
+    if self.threads.at_mut(index) |thread| {
+        let step = thread_turn_advance(thread.machine_state, TurnMachineEvent::Enqueue);
+        if step.outcome != TurnMachineOutcome::Queued {
+            owned_text.deinit(allocator);
+            attachments.deinit(allocator);
+            return -1;
+        }
+        let queued = QueuedTurn {
+            turn_id: turn_id,
+            text: move owned_text,
+            attachments: move attachments
+        };
+        try thread.queue.append(allocator, move queued);
+        thread.machine_state = step.state;
+        thread.updated_at_ms = store::unix_millis();
+        project_id = thread.project_id;
+        kind = thread.provider;
+        effort = thread.effort;
+        try model_copy.append_string(allocator, &thread.model);
+    } else {
+        owned_text.deinit(allocator);
+        attachments.deinit(allocator);
+        return -1;
+    }
+
+    try record_event_strings(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        turn_id,
+        event::EventKind::TurnEnqueued,
+        kind,
+        &model_copy,
+        effort,
+        &text_copy,
+        &detail
+    );
+    return turn_id;
+}
+
+pub fn (self: &var Core) cancel_queued_turn(
+    allocator: Allocator,
+    thread_id: i64,
+    turn_id: i64
+) -> bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    if self.threads.at_mut(index) |thread| {
+        var found: i64 = -1;
+        var q_index: i64 = 0;
+        while thread.queue.at(q_index) |item| {
+            if item.turn_id == turn_id {
+                found = q_index;
+                break;
+            }
+            q_index = q_index + 1;
+        }
+        if found < 0 {
+            return false;
+        }
+        var ev = TurnMachineEvent::CancelMoreQueued;
+        if thread.queue.len() == 1 {
+            ev = TurnMachineEvent::CancelLastQueued;
+        }
+        let step = thread_turn_advance(thread.machine_state, ev);
+        if step.outcome != TurnMachineOutcome::QueueItemRemoved {
+            return false;
+        }
+        if thread.queue.remove(found) |removed| {
+            removed.deinit(allocator);
+            thread.machine_state = step.state;
+            return true;
+        } else |_| {
+            return false;
+        }
+    }
+    return false;
+}
+
+pub fn (self: &var Core) begin_next_queued_turn(
+    allocator: Allocator,
+    thread_id: i64
+) -> mem::Error!i64 {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return -1;
+    }
+    var project_id: i64 = 0;
+    var kind = provider::ProviderKind::LocalEcho;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    var user_text_copy = string::new(allocator);
+    defer user_text_copy.deinit(allocator);
+    var detail = string::new(allocator);
+    defer detail.deinit(allocator);
+    var started_turn_id: i64 = -1;
+
+    if self.threads.at_mut(index) |thread| {
+        if thread.queue.len() == 0 {
+            return -1;
+        }
+        var ev = TurnMachineEvent::StartMoreQueued;
+        if thread.queue.len() == 1 {
+            ev = TurnMachineEvent::StartLastQueued;
+        }
+        let step = thread_turn_advance(thread.machine_state, ev);
+        if step.outcome != TurnMachineOutcome::TurnStarted {
+            return -1;
+        }
+        if thread.queue.remove(0) |queued| {
+            defer queued.deinit(allocator);
+            started_turn_id = queued.turn_id;
+            try user_text_copy.append_string(allocator, &queued.text);
+            try join_attachments(allocator, &queued.attachments, &var detail);
+            try model_copy.append_string(allocator, &thread.model);
+
+            let message_id = self.next_message_id;
+            self.next_message_id = self.next_message_id + 1;
+            let user_msg = try build_user_message(
+                allocator,
+                message_id,
+                started_turn_id,
+                &queued,
+                thread.provider,
+                &thread.model
+            );
+            try thread.messages.append(allocator, move user_msg);
+            thread.machine_state = step.state;
+            thread.active_turn_id = started_turn_id;
+            thread.streaming_text.clear();
+            thread.last_error.clear();
+            thread.pending_approval.active = false;
+            thread.pending_approval.tool_name.clear();
+            thread.pending_approval.summary.clear();
+            project_id = thread.project_id;
+            kind = thread.provider;
+            effort = thread.effort;
+        } else |_| {
+            return -1;
+        }
+    } else {
+        return -1;
+    }
+
+    try record_event_with_model(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        started_turn_id,
+        event::EventKind::TurnStarted,
+        kind,
+        &model_copy,
+        effort,
+        "",
+        ""
+    );
+    try record_event_strings(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        started_turn_id,
+        event::EventKind::MessageUser,
+        kind,
+        &model_copy,
+        effort,
+        &user_text_copy,
+        &detail
+    );
+    return started_turn_id;
+}
+
+pub fn (self: &var Core) append_active_delta(
+    allocator: Allocator,
+    thread_id: i64,
+    chunk: []u8
+) -> mem::Error!bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var project_id: i64 = 0;
+    var turn_id: i64 = 0;
+    var kind = provider::ProviderKind::LocalEcho;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    if self.threads.at_mut(index) |thread| {
+        if thread.machine_state != TurnMachineState::RunningEmpty and
+            thread.machine_state != TurnMachineState::RunningQueued {
+            return false;
+        }
+        try thread.streaming_text.append_bytes(allocator, chunk);
+        project_id = thread.project_id;
+        turn_id = thread.active_turn_id;
+        kind = thread.provider;
+        effort = thread.effort;
+        try model_copy.append_string(allocator, &thread.model);
+    } else {
+        return false;
+    }
+    try record_event_with_model(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        turn_id,
+        event::EventKind::MessageDelta,
+        kind,
+        &model_copy,
+        effort,
+        chunk,
+        ""
+    );
+    return true;
+}
+
+pub fn (self: &var Core) request_tool_approval(
+    allocator: Allocator,
+    thread_id: i64,
+    tool_name: []u8,
+    summary: []u8
+) -> mem::Error!bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var project_id: i64 = 0;
+    var turn_id: i64 = 0;
+    var kind = provider::ProviderKind::LocalEcho;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    if self.threads.at_mut(index) |thread| {
+        let step = thread_turn_advance(thread.machine_state, TurnMachineEvent::RequestApproval);
+        if step.outcome != TurnMachineOutcome::ApprovalRequested {
+            return false;
+        }
+        thread.machine_state = step.state;
+        thread.pending_approval.active = true;
+        thread.pending_approval.tool_name.clear();
+        try thread.pending_approval.tool_name.append_bytes(allocator, tool_name);
+        thread.pending_approval.summary.clear();
+        try thread.pending_approval.summary.append_bytes(allocator, summary);
+        project_id = thread.project_id;
+        turn_id = thread.active_turn_id;
+        kind = thread.provider;
+        effort = thread.effort;
+        try model_copy.append_string(allocator, &thread.model);
+    } else {
+        return false;
+    }
+    try record_event_with_model(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        turn_id,
+        event::EventKind::ToolApprovalRequested,
+        kind,
+        &model_copy,
+        effort,
+        tool_name,
+        summary
+    );
+    return true;
+}
+
+pub fn (self: &var Core) resolve_tool_approval(
+    allocator: Allocator,
+    thread_id: i64,
+    approve: bool
+) -> mem::Error!bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    let s_idx = self.session_index(thread_id);
+    if s_idx >= 0 {
+        if self.sessions.at_mut(s_idx) |session| {
+            let _ = try session.resolve_permission(allocator, approve);
+        }
+    }
+    var project_id: i64 = 0;
+    var turn_id: i64 = 0;
+    var kind = provider::ProviderKind::LocalEcho;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    var tool_copy = string::new(allocator);
+    defer tool_copy.deinit(allocator);
+    if self.threads.at_mut(index) |thread| {
+        var ev = TurnMachineEvent::DenyTool;
+        if approve {
+            ev = TurnMachineEvent::ApproveTool;
+        }
+        let step = thread_turn_advance(thread.machine_state, ev);
+        if step.outcome != TurnMachineOutcome::ApprovalGranted and
+            step.outcome != TurnMachineOutcome::ApprovalDenied {
+            return false;
+        }
+        thread.machine_state = step.state;
+        try tool_copy.append_string(allocator, &thread.pending_approval.tool_name);
+        thread.pending_approval.active = false;
+        thread.pending_approval.tool_name.clear();
+        thread.pending_approval.summary.clear();
+        turn_id = thread.active_turn_id;
+        if !approve {
+            thread.active_turn_id = 0;
+            thread.streaming_text.clear();
+            thread.last_error.clear();
+            try thread.last_error.append_bytes(allocator, "ツール実行が拒否されました");
+        }
+        project_id = thread.project_id;
+        kind = thread.provider;
+        effort = thread.effort;
+        try model_copy.append_string(allocator, &thread.model);
+    } else {
+        return false;
+    }
+    var decision: []u8 = "denied";
+    if approve {
+        decision = "approved";
+    }
+    try record_event_with_detail_string(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        turn_id,
+        event::EventKind::ToolApprovalResolved,
+        kind,
+        &model_copy,
+        effort,
+        decision,
+        &tool_copy
+    );
+    return true;
+}
+
+pub fn (self: &var Core) finish_active_turn(
+    allocator: Allocator,
+    thread_id: i64,
+    assistant_text: []u8
+) -> mem::Error!bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var project_id: i64 = 0;
+    var turn_id: i64 = 0;
+    var kind = provider::ProviderKind::LocalEcho;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    var final_text_copy = string::new(allocator);
+    defer final_text_copy.deinit(allocator);
+    var empty_detail = string::new(allocator);
+    defer empty_detail.deinit(allocator);
+
+    if self.threads.at_mut(index) |thread| {
+        let step = thread_turn_advance(thread.machine_state, TurnMachineEvent::CompleteTurn);
+        if step.outcome != TurnMachineOutcome::TurnCompleted {
+            return false;
+        }
+        if mem::len(assistant_text) > 0 {
+            try final_text_copy.append_bytes(allocator, assistant_text);
+        } else {
+            try final_text_copy.append_string(allocator, &thread.streaming_text);
+        }
+        try model_copy.append_string(allocator, &thread.model);
+        let message_id = self.next_message_id;
+        self.next_message_id = self.next_message_id + 1;
+        turn_id = thread.active_turn_id;
+        let assistant_msg = try build_assistant_message(
+            allocator,
+            message_id,
+            turn_id,
+            &final_text_copy,
+            thread.provider,
+            &thread.model
+        );
+        try thread.messages.append(allocator, move assistant_msg);
+        thread.machine_state = step.state;
+        thread.updated_at_ms = store::unix_millis();
+        thread.active_turn_id = 0;
+        thread.streaming_text.clear();
+        try finalize_running_activities(allocator, &var thread.activities, "completed");
+        project_id = thread.project_id;
+        kind = thread.provider;
+        effort = thread.effort;
+    } else {
+        return false;
+    }
+
+    try record_event_strings(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        turn_id,
+        event::EventKind::MessageCompleted,
+        kind,
+        &model_copy,
+        effort,
+        &final_text_copy,
+        &empty_detail
+    );
+    try record_event_with_model(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        turn_id,
+        event::EventKind::TurnCompleted,
+        kind,
+        &model_copy,
+        effort,
+        "",
+        ""
+    );
+    return true;
+}
+
+pub fn (self: &var Core) fail_active_turn(
+    allocator: Allocator,
+    thread_id: i64,
+    reason: []u8
+) -> mem::Error!bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var project_id: i64 = 0;
+    var turn_id: i64 = 0;
+    var kind = provider::ProviderKind::LocalEcho;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+
+    if self.threads.at_mut(index) |thread| {
+        let step = thread_turn_advance(thread.machine_state, TurnMachineEvent::FailTurn);
+        if step.outcome != TurnMachineOutcome::TurnFailed {
+            return false;
+        }
+        turn_id = thread.active_turn_id;
+        thread.machine_state = step.state;
+        thread.updated_at_ms = store::unix_millis();
+        thread.active_turn_id = 0;
+        thread.streaming_text.clear();
+        try finalize_running_activities(allocator, &var thread.activities, "failed");
+        thread.last_error.clear();
+        try thread.last_error.append_bytes(allocator, reason);
+        project_id = thread.project_id;
+        kind = thread.provider;
+        effort = thread.effort;
+        try model_copy.append_string(allocator, &thread.model);
+    } else {
+        return false;
+    }
+
+    try record_event_with_model(
+        allocator,
+        &var self.store,
+        project_id,
+        thread_id,
+        turn_id,
+        event::EventKind::TurnFailed,
+        kind,
+        &model_copy,
+        effort,
+        "",
+        reason
+    );
+    return true;
+}
+
+pub fn (self: &var Core) cancel_active_turn(
+    allocator: Allocator,
+    thread_id: i64
+) -> mem::Error!bool {
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var awaiting = false;
+    if self.threads.at(index) |thread| {
+        if thread.machine_state == TurnMachineState::AwaitingApprovalEmpty or
+            thread.machine_state == TurnMachineState::AwaitingApprovalQueued {
+            awaiting = true;
+        }
+    }
+    if awaiting {
+        return self.resolve_tool_approval(allocator, thread_id, false);
+    }
+    let s_idx = self.session_index(thread_id);
+    if s_idx >= 0 {
+        if self.sessions.at_mut(s_idx) |session| {
+            let _ = try session.cancel_turn(allocator);
+        }
+    }
+    return self.fail_active_turn(allocator, thread_id, "ターンを停止しました");
+}
+
+fn finalize_running_activities(
+    allocator: Allocator,
+    activities: &var array::Array<ThreadActivity>,
+    final_status: []u8
+) -> mem::Error!void {
+    var idx: i64 = 0;
+    while activities.at_mut(idx) |act| {
+        let st_bytes = act.status.as_bytes();
+        let is_running = mem::equal_bytes(st_bytes, "running");
+        if is_running {
+            act.status.clear();
+            try act.status.append_bytes(allocator, final_status);
+        }
+        idx = idx + 1;
+    }
+    return;
+}
+
+fn upsert_thread_activity(
+    allocator: Allocator,
+    thread: &var Thread,
+    call_id: &string::String,
+    kind: &string::String,
+    title: &string::String,
+    status: &string::String,
+    detail: &string::String
+) -> mem::Error!void {
+    let cid_bytes = call_id.as_bytes();
+    if mem::len(cid_bytes) > 0 {
+        var idx: i64 = thread.activities.len() - 1;
+        while idx >= 0 {
+            if thread.activities.at_mut(idx) |existing| {
+                let ex_cid = existing.call_id.as_bytes();
+                if existing.turn_id == thread.active_turn_id and mem::equal_bytes(ex_cid, cid_bytes) {
+                    if title.len() > 0 {
+                        existing.title.clear();
+                        try existing.title.append_string(allocator, title);
+                    }
+                    if status.len() > 0 {
+                        existing.status.clear();
+                        try existing.status.append_string(allocator, status);
+                    }
+                    if detail.len() > 0 {
+                        let k_bytes = kind.as_bytes();
+                        if mem::equal_bytes(k_bytes, "thought") {
+                            if existing.detail.len() < 400 {
+                                try existing.detail.append_string(allocator, detail);
+                            }
+                        } else {
+                            existing.detail.clear();
+                            try existing.detail.append_string(allocator, detail);
+                        }
+                    }
+                    return;
+                }
+            }
+            idx = idx - 1;
+        }
+    }
+    while thread.activities.len() >= 40 {
+        if thread.activities.remove(0) |old| {
+            old.deinit(allocator);
+        } else |_| {
+            break;
+        }
+    }
+    var owned_cid = string::new(allocator);
+    errdefer owned_cid.deinit(allocator);
+    try owned_cid.append_string(allocator, call_id);
+    var owned_kind = string::new(allocator);
+    errdefer owned_kind.deinit(allocator);
+    if kind.len() > 0 {
+        try owned_kind.append_string(allocator, kind);
+    } else {
+        try owned_kind.append_bytes(allocator, "tool");
+    }
+    var owned_title = string::new(allocator);
+    errdefer owned_title.deinit(allocator);
+    if title.len() > 0 {
+        try owned_title.append_string(allocator, title);
+    } else {
+        try owned_title.append_bytes(allocator, "処理中");
+    }
+    var owned_status = string::new(allocator);
+    errdefer owned_status.deinit(allocator);
+    if status.len() > 0 {
+        try owned_status.append_string(allocator, status);
+    } else {
+        try owned_status.append_bytes(allocator, "running");
+    }
+    var owned_detail = string::new(allocator);
+    errdefer owned_detail.deinit(allocator);
+    try owned_detail.append_string(allocator, detail);
+    let act = ThreadActivity {
+        turn_id: thread.active_turn_id,
+        call_id: move owned_cid,
+        kind: move owned_kind,
+        title: move owned_title,
+        status: move owned_status,
+        detail: move owned_detail
+    };
+    return thread.activities.append(allocator, move act);
+}
+
+fn is_default_or_blank_model(model: &string::String) -> bool {
+    let bytes = model.as_bytes();
+    return is_blank(bytes) or mem::equal_bytes(bytes, "default");
+}
+
+fn apply_session_events(
+    allocator: Allocator,
+    core: &var Core,
+    thread_id: i64,
+    events: &array::Array<provider::SessionEvent>
+) -> mem::Error!bool {
+    var changed = false;
+    var completed = false;
+    var idx: i64 = 0;
+    while events.at(idx) |ev| {
+        if ev.kind == provider::SessionEventKind::SessionIdUpdated {
+            let t_idx = core.thread_index(thread_id);
+            if t_idx >= 0 {
+                var proj_id: i64 = 0;
+                var kind = provider::ProviderKind::LocalEcho;
+                var effort = provider::ReasoningEffort::Medium;
+                var model_copy = string::new(allocator);
+                defer model_copy.deinit(allocator);
+                if core.threads.at_mut(t_idx) |thread| {
+                    thread.provider_session_id.clear();
+                    try thread.provider_session_id.append_string(allocator, &ev.session_id);
+                    proj_id = thread.project_id;
+                    kind = thread.provider;
+                    effort = thread.effort;
+                    try model_copy.append_string(allocator, &thread.model);
+                    changed = true;
+                }
+                if changed {
+                    try record_event_with_detail_string(
+                        allocator,
+                        &var core.store,
+                        proj_id,
+                        thread_id,
+                        0,
+                        event::EventKind::ProviderChanged,
+                        kind,
+                        &model_copy,
+                        effort,
+                        provider::provider_display_name(kind),
+                        &ev.session_id
+                    );
+                }
+            }
+        } else if ev.kind == provider::SessionEventKind::ModelsUpdated {
+            let t_idx = core.thread_index(thread_id);
+            if t_idx >= 0 {
+                if core.threads.at_mut(t_idx) |thread| {
+                    try replace_string_array(allocator, &var thread.available_models, &ev.models);
+                    if is_default_or_blank_model(&thread.model) and ev.current_model.len() > 0 {
+                        thread.model.clear();
+                        try thread.model.append_string(allocator, &ev.current_model);
+                    }
+                    changed = true;
+                }
+            }
+        } else if ev.kind == provider::SessionEventKind::Activity {
+            let t_idx = core.thread_index(thread_id);
+            if t_idx >= 0 {
+                var proj_id: i64 = 0;
+                var turn_id: i64 = 0;
+                var kind = provider::ProviderKind::LocalEcho;
+                var effort = provider::ReasoningEffort::Medium;
+                var model_copy = string::new(allocator);
+                defer model_copy.deinit(allocator);
+                if core.threads.at_mut(t_idx) |thread| {
+                    try upsert_thread_activity(
+                        allocator,
+                        thread,
+                        &ev.call_id,
+                        &ev.activity_kind,
+                        &ev.text,
+                        &ev.activity_status,
+                        &ev.detail
+                    );
+                    proj_id = thread.project_id;
+                    turn_id = thread.active_turn_id;
+                    kind = thread.provider;
+                    effort = thread.effort;
+                    try model_copy.append_string(allocator, &thread.model);
+                    changed = true;
+                }
+                if changed {
+                    try record_event_strings(
+                        allocator,
+                        &var core.store,
+                        proj_id,
+                        thread_id,
+                        turn_id,
+                        event::EventKind::Activity,
+                        kind,
+                        &model_copy,
+                        effort,
+                        &ev.text,
+                        &ev.detail
+                    );
+                }
+            }
+        } else if ev.kind == provider::SessionEventKind::Delta {
+            if try append_delta_string(allocator, core, thread_id, &ev.text) {
+                changed = true;
+            }
+        } else if ev.kind == provider::SessionEventKind::PermissionRequested {
+            if try request_approval_strings(allocator, core, thread_id, &ev.text, &ev.detail) {
+                changed = true;
+                if core.auto_approve_tools {
+                    let _ = try core.resolve_tool_approval(allocator, thread_id, true);
+                }
+            }
+        } else if ev.kind == provider::SessionEventKind::TurnCompleted {
+            if try finish_turn_string(allocator, core, thread_id, &ev.text) {
+                changed = true;
+                completed = true;
+            }
+        } else if ev.kind == provider::SessionEventKind::TurnFailed {
+            if try fail_turn_string(allocator, core, thread_id, &ev.detail) {
+                changed = true;
+            }
+        }
+        idx = idx + 1;
+    }
+    if completed {
+        let t_idx = core.thread_index(thread_id);
+        if t_idx >= 0 {
+            var has_queue = false;
+            if core.threads.at(t_idx) |thread| {
+                has_queue = thread.machine_state == TurnMachineState::IdleQueued and
+                    thread.queue.len() > 0;
+            }
+            if has_queue {
+                let _ = try core.process_next_queued(allocator, thread_id);
+            }
+        }
+    }
+    return changed;
+}
+
+fn start_live_session_turn(
+    allocator: Allocator,
+    core: &var Core,
+    thread_id: i64,
+    kind: provider::ProviderKind,
+    cwd: &string::String,
+    model: &string::String,
+    effort: provider::ReasoningEffort,
+    resume_sid: &string::String,
+    prompt: &string::String,
+    attachments: &array::Array<string::String>
+) -> mem::Error!bool {
+    var s_idx = core.session_index(thread_id);
+    if s_idx < 0 {
+        let session = provider::new_provider_session(allocator, thread_id, kind);
+        try core.sessions.append(allocator, move session);
+        s_idx = core.sessions.len() - 1;
+    }
+    var events = array::new<provider::SessionEvent>(allocator);
+    defer events.deinit(allocator);
+    var started = false;
+    let cwd_bytes = cwd.as_bytes();
+    let model_bytes = model.as_bytes();
+    let sid_bytes = resume_sid.as_bytes();
+    let prompt_bytes = prompt.as_bytes();
+    let socket_bytes = core.bridge_socket.as_bytes();
+    let bin_bytes = core.bridge_bin.as_bytes();
+    if core.sessions.at_mut(s_idx) |session| {
+        started = try session.start_turn(
+            allocator,
+            kind,
+            cwd_bytes,
+            model_bytes,
+            effort,
+            sid_bytes,
+            core.suppress_telemetry,
+            socket_bytes,
+            bin_bytes,
+            &core.command_overrides,
+            prompt_bytes,
+            attachments,
+            &var events
+        );
+    }
+    let _ = try apply_session_events(allocator, core, thread_id, &events);
+    return started;
+}
+
+pub fn (self: &var Core) process_next_queued(
+    allocator: Allocator,
+    thread_id: i64
+) -> mem::Error!bool {
+    let turn_id = try self.begin_next_queued_turn(allocator, thread_id);
+    if turn_id < 0 {
+        return false;
+    }
+    let index = self.thread_index(thread_id);
+    if index < 0 {
+        return false;
+    }
+    var kind = provider::ProviderKind::LocalEcho;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    var prompt_copy = string::new(allocator);
+    defer prompt_copy.deinit(allocator);
+    var cwd_copy = string::new(allocator);
+    defer cwd_copy.deinit(allocator);
+    var sid_copy = string::new(allocator);
+    defer sid_copy.deinit(allocator);
+    var attachments_copy = array::new<string::String>(allocator);
+    defer attachments_copy.deinit(allocator);
+
+    if self.threads.at(index) |thread| {
+        kind = thread.provider;
+        effort = thread.effort;
+        try model_copy.append_string(allocator, &thread.model);
+        try sid_copy.append_string(allocator, &thread.provider_session_id);
+        if thread.workspace.mode == workspace::WorkspaceMode::GitWorktree and
+            thread.workspace.worktree_path.len() > 0 {
+            try cwd_copy.append_string(allocator, &thread.workspace.worktree_path);
+        } else {
+            try cwd_copy.append_string(allocator, &thread.workspace.root_path);
+        }
+        let msg_count = thread.messages.len();
+        if msg_count > 0 {
+            if thread.messages.at(msg_count - 1) |last| {
+                try prompt_copy.append_string(allocator, &last.text);
+                try replace_string_array(allocator, &var attachments_copy, &last.attachments);
+            }
+        }
+    }
+
+    if kind == provider::ProviderKind::LocalEcho {
+        let output = try run_local_turn_strings(
+            allocator,
+            kind,
+            &model_copy,
+            effort,
+            &prompt_copy,
+            attachments_copy.len(),
+            self.suppress_telemetry
+        );
+        defer output.deinit(allocator);
+
+        var chunk_index = 0;
+        while output.chunks.at(chunk_index) |chunk| {
+            let _ = try append_delta_string(allocator, self, thread_id, chunk);
+            chunk_index = chunk_index + 1;
+        }
+        return finish_turn_string(allocator, self, thread_id, &output.final_text);
+    }
+
+    let _ = try start_live_session_turn(
+        allocator,
+        self,
+        thread_id,
+        kind,
+        &cwd_copy,
+        &model_copy,
+        effort,
+        &sid_copy,
+        &prompt_copy,
+        &attachments_copy
+    );
+    return true;
+}
+
+fn steer_session_strings(
+    allocator: Allocator,
+    session: &var provider::ProviderSession,
+    prompt: &string::String,
+    attachments: &array::Array<string::String>,
+    events: &var array::Array<provider::SessionEvent>
+) -> mem::Error!bool {
+    let prompt_bytes = prompt.as_bytes();
+    return session.steer_prompt(allocator, prompt_bytes, attachments, events);
+}
+
+fn build_steered_user_message(
+    allocator: Allocator,
+    id: i64,
+    turn_id: i64,
+    text: &string::String,
+    attachments: &array::Array<string::String>,
+    provider_kind: provider::ProviderKind,
+    model: &string::String
+) -> mem::Error!Message {
+    var msg_text = string::new(allocator);
+    errdefer msg_text.deinit(allocator);
+    try msg_text.append_string(allocator, text);
+    var msg_attachments = try clone_string_array(allocator, attachments);
+    errdefer msg_attachments.deinit(allocator);
+    var msg_provider = try string::from_bytes(allocator, provider::provider_id(provider_kind));
+    errdefer msg_provider.deinit(allocator);
+    var msg_model = string::new(allocator);
+    errdefer msg_model.deinit(allocator);
+    try msg_model.append_string(allocator, model);
+    return Message {
+        id: id,
+        turn_id: turn_id,
+        role: MessageRole::User,
+        text: move msg_text,
+        attachments: move msg_attachments,
+        provider: move msg_provider,
+        model: move msg_model
+    };
+}
+
+fn try_steer_active_turn(
+    allocator: Allocator,
+    core: &var Core,
+    thread_id: i64,
+    text: []u8,
+    attachments_nl: []u8
+) -> mem::Error!i64 {
+    if is_blank(text) {
+        return 0;
+    }
+    let t_idx = core.thread_index(thread_id);
+    if t_idx < 0 {
+        return 0;
+    }
+    var can_steer = false;
+    if core.threads.at(t_idx) |thread| {
+        if thread.provider == provider::ProviderKind::AntigravityAcp and
+            (thread.machine_state == TurnMachineState::RunningEmpty or
+            thread.machine_state == TurnMachineState::RunningQueued) {
+            can_steer = true;
+        }
+    }
+    if !can_steer {
+        return 0;
+    }
+    let s_idx = core.session_index(thread_id);
+    if s_idx < 0 {
+        return 0;
+    }
+    var owned_text = try string::from_bytes(allocator, text);
+    defer owned_text.deinit(allocator);
+    string::trim_space_in_place(&var owned_text);
+    if owned_text.len() == 0 {
+        return 0;
+    }
+    var attachments = try parse_attachments(allocator, attachments_nl);
+    defer attachments.deinit(allocator);
+
+    var events = array::new<provider::SessionEvent>(allocator);
+    defer events.deinit(allocator);
+    var steered = false;
+    if core.sessions.at_mut(s_idx) |session| {
+        steered = try steer_session_strings(
+            allocator,
+            session,
+            &owned_text,
+            &attachments,
+            &var events
+        );
+    }
+    if !steered {
+        let _ = try apply_session_events(allocator, core, thread_id, &events);
+        return 0;
+    }
+
+    var project_id: i64 = 0;
+    var active_turn_id: i64 = 0;
+    var kind = provider::ProviderKind::AntigravityAcp;
+    var effort = provider::ReasoningEffort::Medium;
+    var model_copy = string::new(allocator);
+    defer model_copy.deinit(allocator);
+    var detail = string::new(allocator);
+    defer detail.deinit(allocator);
+    try join_attachments(allocator, &attachments, &var detail);
+    var flushed_partial = string::new(allocator);
+    defer flushed_partial.deinit(allocator);
+    var empty_detail = string::new(allocator);
+    defer empty_detail.deinit(allocator);
+
+    if core.threads.at_mut(t_idx) |thread| {
+        project_id = thread.project_id;
+        active_turn_id = thread.active_turn_id;
+        kind = thread.provider;
+        effort = thread.effort;
+        try model_copy.append_string(allocator, &thread.model);
+        if thread.streaming_text.len() > 0 {
+            try flushed_partial.append_string(allocator, &thread.streaming_text);
+            let partial_msg_id = core.next_message_id;
+            core.next_message_id = core.next_message_id + 1;
+            let partial_msg = try build_assistant_message(
+                allocator,
+                partial_msg_id,
+                active_turn_id,
+                &flushed_partial,
+                thread.provider,
+                &thread.model
+            );
+            try thread.messages.append(allocator, move partial_msg);
+            thread.streaming_text.clear();
+        }
+        let user_msg_id = core.next_message_id;
+        core.next_message_id = core.next_message_id + 1;
+        let user_msg = try build_steered_user_message(
+            allocator,
+            user_msg_id,
+            active_turn_id,
+            &owned_text,
+            &attachments,
+            thread.provider,
+            &thread.model
+        );
+        try thread.messages.append(allocator, move user_msg);
+        thread.updated_at_ms = store::unix_millis();
+    } else {
+        return 0;
+    }
+
+    if flushed_partial.len() > 0 {
+        try record_event_strings(
+            allocator,
+            &var core.store,
+            project_id,
+            thread_id,
+            active_turn_id,
+            event::EventKind::MessageCompleted,
+            kind,
+            &model_copy,
+            effort,
+            &flushed_partial,
+            &empty_detail
+        );
+    }
+    try record_event_strings(
+        allocator,
+        &var core.store,
+        project_id,
+        thread_id,
+        active_turn_id,
+        event::EventKind::MessageUser,
+        kind,
+        &model_copy,
+        effort,
+        &owned_text,
+        &detail
+    );
+    let _ = try apply_session_events(allocator, core, thread_id, &events);
+    if active_turn_id > 0 {
+        return active_turn_id;
+    }
+    return 1;
+}
+
+pub fn (self: &var Core) send_message(
+    allocator: Allocator,
+    thread_id: i64,
+    text: []u8,
+    attachments_nl: []u8
+) -> mem::Error!i64 {
+    let steered = try try_steer_active_turn(allocator, self, thread_id, text, attachments_nl);
+    if steered > 0 {
+        return steered;
+    }
+    let turn_id = try self.enqueue_turn(allocator, thread_id, text, attachments_nl);
+    if turn_id < 0 {
+        return -1;
+    }
+    let index = self.thread_index(thread_id);
+    if index >= 0 {
+        var busy = false;
+        var is_local = false;
+        if self.threads.at(index) |thread| {
+            busy = thread_turn_is_running_or_waiting(thread.machine_state);
+            is_local = thread.provider == provider::ProviderKind::LocalEcho;
+        }
+        if !busy {
+            if is_local {
+                while try self.process_next_queued(allocator, thread_id) {}
+            } else {
+                let _ = try self.process_next_queued(allocator, thread_id);
+            }
+        }
+    }
+    return turn_id;
+}
+
+pub fn (self: &var Core) poll_providers(allocator: Allocator) -> mem::Error!bool {
+    var any_changed = false;
+    var index: i64 = 0;
+    while index < self.sessions.len() {
+        var thread_id: i64 = 0;
+        var events = array::new<provider::SessionEvent>(allocator);
+        defer events.deinit(allocator);
+        if self.sessions.at_mut(index) |session| {
+            thread_id = session.thread_id;
+            if try session.poll(allocator, &var events) {
+                any_changed = true;
+            }
+        }
+        if events.len() > 0 {
+            if try apply_session_events(allocator, self, thread_id, &events) {
+                any_changed = true;
+            }
+        }
+        index = index + 1;
+    }
+    return any_changed;
+}
+
+pub fn (self: &Core) provider_wakeup_fds_json(
+    allocator: Allocator,
+    out: &var string::String
+) -> mem::Error!void {
+    var encoder = json::encoder(allocator);
+    defer encoder.deinit(allocator);
+    try encoder.begin_array();
+    var idx: i64 = 0;
+    while self.sessions.at(idx) |session| {
+        let fd = session.wakeup_fd();
+        if fd >= 0 {
+            try encoder.begin_object();
+            try encoder.write_i64_field("thread_id", session.thread_id);
+            try encoder.write_i64_field("fd", cast<i64>(fd));
+            try encoder.end_object();
+        }
+        idx = idx + 1;
+    }
+    try encoder.end_array();
+    return encoder.finish_into(allocator, out);
+}
+
+fn write_string_array(encoder: &var json::Encoder, items: &array::Array<string::String>) -> mem::Error!void {
+    var index = 0;
+    while items.at(index) |item| {
+        let bytes = item.as_bytes();
+        try encoder.write_bytes(bytes);
+        index = index + 1;
+    }
+    return;
+}
+
+fn (self: &Core) session_state_for_thread(thread_id: i64) -> []u8 {
+    let idx = self.session_index(thread_id);
+    if idx >= 0 {
+        if self.sessions.at(idx) |session| {
+            return provider::provider_session_state_name(session.state);
+        }
+    }
+    return "disconnected";
+}
+
+fn write_thread_json(
+    encoder: &var json::Encoder,
+    core: &Core,
+    thread: &Thread
+) -> mem::Error!void {
+    try encoder.begin_object();
+    try encoder.write_i64_field("id", thread.id);
+    try encoder.write_i64_field("project_id", thread.project_id);
+    let title_bytes = thread.title.as_bytes();
+    try encoder.write_bytes_field("title", title_bytes);
+    try encoder.write_i64_field("updated_at_ms", thread.updated_at_ms);
+    try encoder.write_bytes_field("status", thread_turn_status_name(thread.machine_state));
+    try encoder.write_bytes_field("session_state", core.session_state_for_thread(thread.id));
+    try encoder.write_bytes_field("provider", provider::provider_id(thread.provider));
+    try encoder.write_bytes_field("provider_name", provider::provider_display_name(thread.provider));
+    let model_bytes = thread.model.as_bytes();
+    try encoder.write_bytes_field("model", model_bytes);
+    try encoder.write_bytes_field("effort", provider::effort_id(thread.effort));
+    try encoder.write_i64_field("active_turn_id", thread.active_turn_id);
+    let stream_bytes = thread.streaming_text.as_bytes();
+    try encoder.write_bytes_field("streaming_text", stream_bytes);
+    let err_bytes = thread.last_error.as_bytes();
+    try encoder.write_bytes_field("last_error", err_bytes);
+    try encoder.begin_array_field("available_models");
+    try write_string_array(encoder, &thread.available_models);
+    try encoder.end_array();
+    try encoder.begin_array_field("activities");
+    var a_index = 0;
+    while thread.activities.at(a_index) |act| {
+        try encoder.begin_object();
+        try encoder.write_i64_field("turn_id", act.turn_id);
+        let cid_bytes = act.call_id.as_bytes();
+        try encoder.write_bytes_field("call_id", cid_bytes);
+        let ak_bytes = act.kind.as_bytes();
+        try encoder.write_bytes_field("kind", ak_bytes);
+        let at_bytes = act.title.as_bytes();
+        try encoder.write_bytes_field("title", at_bytes);
+        let as_bytes = act.status.as_bytes();
+        try encoder.write_bytes_field("status", as_bytes);
+        let ad_bytes = act.detail.as_bytes();
+        try encoder.write_bytes_field("detail", ad_bytes);
+        try encoder.end_object();
+        a_index = a_index + 1;
+    }
+    try encoder.end_array();
+    try encoder.begin_object_field("pending_approval");
+    try encoder.write_bool_field("active", thread.pending_approval.active);
+    let tool_bytes = thread.pending_approval.tool_name.as_bytes();
+    try encoder.write_bytes_field("tool_name", tool_bytes);
+    let summary_bytes = thread.pending_approval.summary.as_bytes();
+    try encoder.write_bytes_field("summary", summary_bytes);
+    try encoder.end_object();
+    try encoder.begin_object_field("workspace");
+    try workspace::write_workspace_json(encoder, &thread.workspace);
+    try encoder.end_object();
+
+    try encoder.begin_array_field("messages");
+    var m_index = 0;
+    while thread.messages.at(m_index) |message| {
+        try encoder.begin_object();
+        try encoder.write_i64_field("id", message.id);
+        try encoder.write_i64_field("turn_id", message.turn_id);
+        try encoder.write_bytes_field("role", role_name(message.role));
+        let text_bytes = message.text.as_bytes();
+        try encoder.write_bytes_field("text", text_bytes);
+        let p_bytes = message.provider.as_bytes();
+        try encoder.write_bytes_field("provider", p_bytes);
+        let mod_bytes = message.model.as_bytes();
+        try encoder.write_bytes_field("model", mod_bytes);
+        try encoder.begin_array_field("attachments");
+        try write_string_array(encoder, &message.attachments);
+        try encoder.end_array();
+        try encoder.end_object();
+        m_index = m_index + 1;
+    }
+    try encoder.end_array();
+
+    try encoder.begin_array_field("queue");
+    var q_index = 0;
+    while thread.queue.at(q_index) |queued| {
+        try encoder.begin_object();
+        try encoder.write_i64_field("turn_id", queued.turn_id);
+        let q_bytes = queued.text.as_bytes();
+        try encoder.write_bytes_field("text", q_bytes);
+        try encoder.begin_array_field("attachments");
+        try write_string_array(encoder, &queued.attachments);
+        try encoder.end_array();
+        try encoder.end_object();
+        q_index = q_index + 1;
+    }
+    try encoder.end_array();
+    return encoder.end_object();
+}
+
+pub fn (self: &Core) snapshot_json(allocator: Allocator, out: &var string::String) -> mem::Error!void {
+    var encoder = json::encoder(allocator);
+    defer encoder.deinit(allocator);
+    try encoder.begin_object();
+    try encoder.write_i64_field("schema_version", 1);
+    try encoder.write_i64_field("active_project_id", self.active_project_id);
+    try encoder.write_i64_field("active_thread_id", self.active_thread_id);
+    try encoder.write_bool_field("suppress_telemetry", self.suppress_telemetry);
+    try encoder.write_bool_field("auto_approve_tools", self.auto_approve_tools);
+    try encoder.write_i64_field("event_count", self.store.count());
+
+    try encoder.begin_array_field("providers");
+    try provider::write_catalog_json(allocator, &var encoder, self.suppress_telemetry);
+    try encoder.end_array();
+
+    try encoder.begin_array_field("projects");
+    var p_index = 0;
+    while self.projects.at(p_index) |project| {
+        try encoder.begin_object();
+        try encoder.write_i64_field("id", project.id);
+        let name_bytes = project.name.as_bytes();
+        try encoder.write_bytes_field("name", name_bytes);
+        let root_bytes = project.root_path.as_bytes();
+        try encoder.write_bytes_field("root_path", root_bytes);
+        try encoder.end_object();
+        p_index = p_index + 1;
+    }
+    try encoder.end_array();
+
+    try encoder.begin_array_field("threads");
+    var t_index = 0;
+    while self.threads.at(t_index) |thread| {
+        try write_thread_json(&var encoder, self, thread);
+        t_index = t_index + 1;
+    }
+    try encoder.end_array();
+
+    try encoder.end_object();
+    return encoder.finish_into(allocator, out);
+}

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${KUGI_ACTIVE:-}" ]]; then
+  exec kugi exec -- env KUGI_ACTIVE=1 ./scripts/dev-relaunch "$@"
+fi
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_root"
+
+release_mode=false
+background=false
+project_dir="$repo_root"
+
+for arg in "$@"; do
+  case "$arg" in
+    --release)
+      release_mode=true
+      ;;
+    --background)
+      background=true
+      ;;
+    -*)
+      echo "unknown option: $arg" >&2
+      exit 64
+      ;;
+    *)
+      project_dir="$arg"
+      ;;
+  esac
+done
+
+if [[ "$release_mode" == true ]]; then
+  app_path="$(./scripts/native-dev-app | tail -n 1)"
+else
+  app_path="$(./scripts/native-dev-app --fast | tail -n 1)"
+fi
+
+if pgrep -x kasugai-dev-app >/dev/null 2>&1; then
+  /usr/bin/osascript -e 'tell application id "dev.soyukke.kasugai.dev" to quit' >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ! pgrep -x kasugai-dev-app >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.15
+  done
+  if pgrep -x kasugai-dev-app >/dev/null 2>&1; then
+    pkill -TERM -x kasugai-dev-app >/dev/null 2>&1 || true
+    sleep 0.2
+  fi
+fi
+
+if [[ "$app_path" != /* ]]; then
+  app_path="$repo_root/$app_path"
+fi
+
+open_args=(
+  -n
+  --env "KASUGAI_VIEW_RENDERER_DIR=$repo_root/view-renderer"
+  --env "KASUGAI_INITIAL_DIR=$project_dir"
+)
+if [[ "$background" == true ]]; then
+  open_args+=(--env "KASUGAI_LAUNCH_BACKGROUND=1" -g)
+fi
+opened=false
+for _ in 1 2 3 4; do
+  if /usr/bin/open "${open_args[@]}" "$app_path"; then
+    opened=true
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$opened" != true ]]; then
+  exit 1
+fi
+
+printf '%s\n' "$app_path"

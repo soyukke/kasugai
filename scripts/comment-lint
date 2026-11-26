@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+import pathlib
+import sys
+
+def scan_kizu(path, text):
+    errors = []
+    line = 1
+    i = 0
+    n = len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if ch == "\n":
+            in_string = False
+            line += 1
+            i += 1
+            continue
+        if in_string:
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == "\\" and nxt == "\\":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            errors.append(f"{path}:{line}: comment is forbidden")
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        i += 1
+    return errors
+
+def scan_c_style(path, text):
+    errors = []
+    line = 1
+    i = 0
+    n = len(text)
+    in_double = False
+    in_single = False
+    in_template = False
+    in_multiline_swift = False
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if ch == "\n":
+            line += 1
+            i += 1
+            continue
+        if in_multiline_swift:
+            if text[i : i + 3] == '"""':
+                in_multiline_swift = False
+                i += 3
+                continue
+            if ch == "\\":
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if in_single:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_template:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == "`":
+                in_template = False
+            i += 1
+            continue
+        if path.suffix == ".swift" and text[i : i + 3] == '"""':
+            in_multiline_swift = True
+            i += 3
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if path.suffix in (".js", ".css") and ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if path.suffix == ".js" and ch == "`":
+            in_template = True
+            i += 1
+            continue
+        if path.suffix == ".js" and ch == "/" and nxt not in ("/", "*"):
+            prev = text[:i].rstrip()
+            if prev.endswith(("(", "=", ",", ":", "?", "!", "[", "{", ";", "return")):
+                i += 1
+                in_class = False
+                while i < n and text[i] != "\n":
+                    if text[i] == "\\":
+                        i += 2
+                        continue
+                    if text[i] == "[":
+                        in_class = True
+                    elif text[i] == "]":
+                        in_class = False
+                    elif text[i] == "/" and not in_class:
+                        i += 1
+                        break
+                    i += 1
+                continue
+        if path.suffix in (".swift", ".js") and ch == "/" and nxt == "/":
+            errors.append(f"{path}:{line}: comment is forbidden")
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            errors.append(f"{path}:{line}: block comment is forbidden")
+            end = text.find("*/", i + 2)
+            if end < 0:
+                break
+            line += text[i : end + 2].count("\n")
+            i = end + 2
+            continue
+        i += 1
+    return errors
+
+def scan_html(path, text):
+    errors = []
+    idx = 0
+    while True:
+        pos = text.find("<!--", idx)
+        if pos < 0:
+            break
+        line = text[:pos].count("\n") + 1
+        errors.append(f"{path}:{line}: HTML comment is forbidden")
+        end = text.find("-->", pos + 4)
+        if end < 0:
+            break
+        idx = end + 3
+    return errors
+
+def main():
+    root = pathlib.Path(__file__).resolve().parent.parent
+    errors = []
+    for forbidden_doc in ("docs", "TODO.md"):
+        if (root / forbidden_doc).exists():
+            errors.append(f"{forbidden_doc}: documentation/ADR is forbidden")
+    for base in ("core/src", "core/host/src", "core/spec/src", "app/Sources", "app/SpecExport", "view-renderer"):
+        folder = root / base
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root)
+            if path.suffix == ".kizu":
+                errors.extend(scan_kizu(rel, path.read_text(encoding="utf-8")))
+            elif path.suffix == ".html":
+                errors.extend(scan_html(rel, path.read_text(encoding="utf-8")))
+            elif path.suffix in (".swift", ".js", ".css"):
+                errors.extend(scan_c_style(rel, path.read_text(encoding="utf-8")))
+
+    if errors:
+        for err in errors:
+            sys.stderr.write(f"comment-lint: {err}\n")
+        return 1
+    print("comment lint: ok")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

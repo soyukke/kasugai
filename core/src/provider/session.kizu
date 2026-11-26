@@ -1,0 +1,1136 @@
+import std::array;
+import std::fmt;
+import std::mem;
+import std::string;
+
+pub struct CommandOverride {
+    pub kind: ProviderKind,
+    pub executable: string::String,
+    pub arguments: array::Array<string::String>,
+}
+
+pub fn (self: CommandOverride) deinit(allocator: Allocator) -> void {
+    self.executable.deinit(allocator);
+    self.arguments.deinit(allocator);
+}
+
+pub fn new_command_override(
+    allocator: Allocator,
+    kind: ProviderKind,
+    executable: []u8,
+    args_nl: []u8
+) -> mem::Error!CommandOverride {
+    var owned_exec = try string::from_bytes(allocator, executable);
+    errdefer owned_exec.deinit(allocator);
+    var args = array::new<string::String>(allocator);
+    errdefer args.deinit(allocator);
+    var sep = cast<u8>(10);
+    let total = mem::len(args_nl);
+    var scan: i64 = 0;
+    while scan < total {
+        if args_nl[scan] == cast<u8>(31) {
+            sep = cast<u8>(31);
+            break;
+        }
+        scan = scan + 1;
+    }
+    var start: i64 = 0;
+    while start < total {
+        var end = start;
+        while end < total and args_nl[end] != sep {
+            end = end + 1;
+        }
+        var line_end = end;
+        if sep == cast<u8>(10) and line_end > start and args_nl[line_end - 1] == cast<u8>(13) {
+            line_end = line_end - 1;
+        }
+        if line_end > start {
+            var item = try string::from_bytes(allocator, args_nl[start..line_end]);
+            errdefer item.deinit(allocator);
+            try args.append(allocator, move item);
+        }
+        start = end + 1;
+    }
+    return CommandOverride {
+        kind: kind,
+        executable: move owned_exec,
+        arguments: move args
+    };
+}
+
+pub enum SessionEventKind {
+    ModelsUpdated,
+    SessionIdUpdated,
+    Delta,
+    Activity,
+    PermissionRequested,
+    TurnCompleted,
+    TurnFailed,
+}
+
+pub struct SessionEvent {
+    pub kind: SessionEventKind,
+    pub call_id: string::String,
+    pub activity_kind: string::String,
+    pub activity_status: string::String,
+    pub text: string::String,
+    pub detail: string::String,
+    pub session_id: string::String,
+    pub current_model: string::String,
+    pub models: array::Array<string::String>,
+}
+
+pub fn new_session_event(allocator: Allocator, kind: SessionEventKind) -> SessionEvent {
+    return SessionEvent {
+        kind: kind,
+        call_id: string::new(allocator),
+        activity_kind: string::new(allocator),
+        activity_status: string::new(allocator),
+        text: string::new(allocator),
+        detail: string::new(allocator),
+        session_id: string::new(allocator),
+        current_model: string::new(allocator),
+        models: array::new<string::String>(allocator)
+    };
+}
+
+pub fn (self: SessionEvent) deinit(allocator: Allocator) -> void {
+    self.call_id.deinit(allocator);
+    self.activity_kind.deinit(allocator);
+    self.activity_status.deinit(allocator);
+    self.text.deinit(allocator);
+    self.detail.deinit(allocator);
+    self.session_id.deinit(allocator);
+    self.current_model.deinit(allocator);
+    self.models.deinit(allocator);
+}
+
+pub struct ProviderSession {
+    pub thread_id: i64,
+    pub kind: ProviderKind,
+    pub state: ProviderSessionState,
+    pub cwd: string::String,
+    pub model: string::String,
+    pub effort: ReasoningEffort,
+    pub suppress_telemetry: bool,
+    pub session_id: string::String,
+    pub model_option_id: string::String,
+    pub effort_option_id: string::String,
+    pub process: PipeProcess,
+    pub next_req_id: i64,
+    pub init_req_id: i64,
+    pub model_list_req_id: i64,
+    pub session_new_req_id: i64,
+    pub active_prompt_req_id: i64,
+    pub has_pending_prompt: bool,
+    pub pending_prompt_text: string::String,
+    pub pending_prompt_attachments: array::Array<string::String>,
+    pub pending_permission_num_id: i64,
+    pub pending_permission_str_id: string::String,
+    pub allow_option_id: string::String,
+    pub reject_option_id: string::String,
+    pub emitted_delta_in_turn: bool,
+    pub attempting_resume: bool,
+    pub fallback_assistant_text: string::String,
+}
+
+pub fn new_provider_session(
+    allocator: Allocator,
+    thread_id: i64,
+    kind: ProviderKind
+) -> ProviderSession {
+    return ProviderSession {
+        thread_id: thread_id,
+        kind: kind,
+        state: ProviderSessionState::Disconnected,
+        cwd: string::new(allocator),
+        model: string::new(allocator),
+        effort: ReasoningEffort::Medium,
+        suppress_telemetry: true,
+        session_id: string::new(allocator),
+        model_option_id: string::new(allocator),
+        effort_option_id: string::new(allocator),
+        process: empty_pipe_process(allocator),
+        next_req_id: 1,
+        init_req_id: 0,
+        model_list_req_id: 0,
+        session_new_req_id: 0,
+        active_prompt_req_id: 0,
+        has_pending_prompt: false,
+        pending_prompt_text: string::new(allocator),
+        pending_prompt_attachments: array::new<string::String>(allocator),
+        pending_permission_num_id: 0,
+        pending_permission_str_id: string::new(allocator),
+        allow_option_id: string::new(allocator),
+        reject_option_id: string::new(allocator),
+        emitted_delta_in_turn: false,
+        attempting_resume: false,
+        fallback_assistant_text: string::new(allocator)
+    };
+}
+
+pub fn (self: ProviderSession) deinit(allocator: Allocator) -> void {
+    self.cwd.deinit(allocator);
+    self.model.deinit(allocator);
+    self.session_id.deinit(allocator);
+    self.model_option_id.deinit(allocator);
+    self.effort_option_id.deinit(allocator);
+    self.process.deinit(allocator);
+    self.pending_prompt_text.deinit(allocator);
+    self.pending_prompt_attachments.deinit(allocator);
+    self.pending_permission_str_id.deinit(allocator);
+    self.allow_option_id.deinit(allocator);
+    self.reject_option_id.deinit(allocator);
+    self.fallback_assistant_text.deinit(allocator);
+}
+
+pub fn (self: &ProviderSession) wakeup_fd() -> i32 {
+    if self.state == ProviderSessionState::Disconnected or self.state == ProviderSessionState::Failed {
+        return -1;
+    }
+    return self.process.wakeup_fd();
+}
+
+fn (self: &var ProviderSession) alloc_req_id() -> i64 {
+    let id = self.next_req_id;
+    self.next_req_id = self.next_req_id + 1;
+    return id;
+}
+
+fn replace_string_list(
+    allocator: Allocator,
+    dst: &var array::Array<string::String>,
+    src: &array::Array<string::String>
+) -> mem::Error!void {
+    dst.clear(allocator);
+    var idx: i64 = 0;
+    while src.at(idx) |item| {
+        let bytes = item.as_bytes();
+        var copy = try string::from_bytes(allocator, bytes);
+        errdefer copy.deinit(allocator);
+        try dst.append(allocator, move copy);
+        idx = idx + 1;
+    }
+    return;
+}
+
+pub fn (self: &var ProviderSession) disconnect(allocator: Allocator) -> void {
+    self.process.close_in_place();
+    let step = provider_session_advance(self.state, ProviderSessionEvent::Disconnect);
+    self.state = step.state;
+    self.init_req_id = 0;
+    self.model_list_req_id = 0;
+    self.session_new_req_id = 0;
+    self.active_prompt_req_id = 0;
+    self.has_pending_prompt = false;
+    self.pending_prompt_text.clear();
+    self.pending_prompt_attachments.clear(allocator);
+    self.pending_permission_num_id = 0;
+    self.pending_permission_str_id.clear();
+    self.allow_option_id.clear();
+    self.reject_option_id.clear();
+    self.emitted_delta_in_turn = false;
+    self.attempting_resume = false;
+    self.fallback_assistant_text.clear();
+    return;
+}
+
+fn clone_strings(
+    allocator: Allocator,
+    src: &array::Array<string::String>
+) -> mem::Error!array::Array<string::String> {
+    var out = array::new<string::String>(allocator);
+    errdefer out.deinit(allocator);
+    var idx: i64 = 0;
+    while src.at(idx) |item| {
+        let bytes = item.as_bytes();
+        var copy = try string::from_bytes(allocator, bytes);
+        errdefer copy.deinit(allocator);
+        try out.append(allocator, move copy);
+        idx = idx + 1;
+    }
+    return move out;
+}
+
+fn append_telemetry_env(
+    allocator: Allocator,
+    kind: ProviderKind,
+    suppress_telemetry: bool,
+    launch: &var ProcessLaunch
+) -> mem::Error!void {
+    if !suppress_telemetry {
+        return;
+    }
+    if kind == ProviderKind::OpenCodeAcp {
+        return launch.set_env(allocator, "OPENCODE_DISABLE_TELEMETRY", "1");
+    }
+    if kind == ProviderKind::AntigravityAcp {
+        return launch.set_env(allocator, "AGY_DISABLE_TELEMETRY", "1");
+    }
+    if kind == ProviderKind::ClaudeCode {
+        try launch.set_env(allocator, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+        return launch.set_env(allocator, "DISABLE_TELEMETRY", "1");
+    }
+    if kind == ProviderKind::Codex {
+        return launch.set_env(allocator, "CODEX_DISABLE_TELEMETRY", "1");
+    }
+    return;
+}
+
+fn append_orchestrator_env(
+    allocator: Allocator,
+    thread_id: i64,
+    bridge_socket: []u8,
+    bridge_bin: []u8,
+    launch: &var ProcessLaunch
+) -> mem::Error!void {
+    if mem::len(bridge_socket) == 0 {
+        return;
+    }
+    try launch.set_env(allocator, "KASUGAI_CTL_SOCKET", bridge_socket);
+    if mem::len(bridge_bin) > 0 {
+        try launch.set_env(allocator, "KASUGAI_CTL_BIN", bridge_bin);
+    }
+    var tid_str = string::new(allocator);
+    defer tid_str.deinit(allocator);
+    try fmt::append_i64(allocator, &var tid_str, thread_id);
+    let tid_bytes = tid_str.as_bytes();
+    return launch.set_env(allocator, "KASUGAI_THREAD_ID", tid_bytes);
+}
+
+fn build_provider_launch(
+    allocator: Allocator,
+    thread_id: i64,
+    kind: ProviderKind,
+    cwd: []u8,
+    model: []u8,
+    effort: ReasoningEffort,
+    resume_session_id: []u8,
+    suppress_telemetry: bool,
+    bridge_socket: []u8,
+    bridge_bin: []u8,
+    overrides: &array::Array<CommandOverride>
+) -> mem::Error!ProcessLaunch {
+    var launch = new_process_launch(allocator);
+    errdefer launch.deinit(allocator);
+    try launch.set_cwd(allocator, cwd);
+    try append_telemetry_env(allocator, kind, suppress_telemetry, &var launch);
+    try append_orchestrator_env(allocator, thread_id, bridge_socket, bridge_bin, &var launch);
+
+    var matched = false;
+    var ov_idx: i64 = 0;
+    while overrides.at(ov_idx) |ov| {
+        if ov.kind == kind {
+            matched = true;
+            let exec_bytes = ov.executable.as_bytes();
+            try launch.set_executable(allocator, exec_bytes);
+            var arg_idx: i64 = 0;
+            while ov.arguments.at(arg_idx) |arg| {
+                let arg_bytes = arg.as_bytes();
+                try launch.add_arg(allocator, arg_bytes);
+                arg_idx = arg_idx + 1;
+            }
+            break;
+        }
+        ov_idx = ov_idx + 1;
+    }
+
+    if matched {
+        return move launch;
+    }
+
+    try launch.set_executable(allocator, provider_executable(kind));
+    if kind == ProviderKind::OpenCodeAcp {
+        try launch.add_arg(allocator, "acp");
+    } else if kind == ProviderKind::AntigravityAcp {
+        try launch.add_arg(allocator, "acp");
+        if suppress_telemetry {
+            try launch.add_arg(allocator, "--disable-telemetry");
+        }
+    } else if kind == ProviderKind::ClaudeCode {
+        try launch.add_arg(allocator, "-p");
+        try launch.add_arg(allocator, "--verbose");
+        try launch.add_arg(allocator, "--input-format");
+        try launch.add_arg(allocator, "stream-json");
+        try launch.add_arg(allocator, "--output-format");
+        try launch.add_arg(allocator, "stream-json");
+        try launch.add_arg(allocator, "--include-partial-messages");
+        try launch.add_arg(allocator, "--permission-prompts");
+        try launch.add_arg(allocator, "host");
+        if mem::len(model) > 0 and !mem::equal_bytes(model, "default") {
+            try launch.add_arg(allocator, "--model");
+            try launch.add_arg(allocator, model);
+        }
+        try launch.add_arg(allocator, "--effort");
+        try launch.add_arg(allocator, claude_effort_id(effort));
+        if mem::len(resume_session_id) > 0 {
+            try launch.add_arg(allocator, "--resume");
+            try launch.add_arg(allocator, resume_session_id);
+        }
+    } else if kind == ProviderKind::Codex {
+        try launch.add_arg(allocator, "app-server");
+        try launch.add_arg(allocator, "--stdio");
+    }
+    return move launch;
+}
+
+fn write_line_string(proc: &PipeProcess, allocator: Allocator, frame: &string::String) -> bool {
+    let bytes = frame.as_bytes();
+    if proc.write_line(allocator, bytes) {
+        return true;
+    } else |_| {
+        return false;
+    }
+}
+
+fn push_failed_event(
+    allocator: Allocator,
+    out_events: &var array::Array<SessionEvent>,
+    reason: []u8
+) -> mem::Error!void {
+    var ev = new_session_event(allocator, SessionEventKind::TurnFailed);
+    errdefer ev.deinit(allocator);
+    try ev.detail.append_bytes(allocator, reason);
+    return out_events.append(allocator, move ev);
+}
+
+fn send_acp_config_if_needed(
+    allocator: Allocator,
+    session: &var ProviderSession,
+    target_model: []u8,
+    current_model: []u8
+) -> mem::Error!void {
+    if session.model_option_id.len() == 0 or session.session_id.len() == 0 {
+        return;
+    }
+    if mem::len(target_model) == 0 or mem::equal_bytes(target_model, "default") {
+        return;
+    }
+    if mem::equal_bytes(target_model, current_model) {
+        return;
+    }
+    let req_id = session.alloc_req_id();
+    var line = string::new(allocator);
+    defer line.deinit(allocator);
+    let sid = session.session_id.as_bytes();
+    let cid = session.model_option_id.as_bytes();
+    try encode_acp_set_config(allocator, req_id, sid, cid, target_model, &var line);
+    let _ = write_line_string(&session.process, allocator, &line);
+    return;
+}
+
+fn dispatch_prompt_now(
+    allocator: Allocator,
+    session: &var ProviderSession,
+    prompt: []u8,
+    attachments: &array::Array<string::String>,
+    out_events: &var array::Array<SessionEvent>
+) -> mem::Error!bool {
+    let step = provider_session_advance(session.state, ProviderSessionEvent::SendPrompt);
+    if step.outcome != ProviderSessionOutcome::PromptDispatched {
+        return false;
+    }
+    session.state = step.state;
+    session.emitted_delta_in_turn = false;
+    session.fallback_assistant_text.clear();
+
+    var frame = string::new(allocator);
+    defer frame.deinit(allocator);
+    if is_acp_provider(session.kind) {
+        let req_id = session.alloc_req_id();
+        session.active_prompt_req_id = req_id;
+        let sid = session.session_id.as_bytes();
+        try encode_acp_prompt(allocator, req_id, sid, prompt, attachments, &var frame);
+    } else if session.kind == ProviderKind::ClaudeCode {
+        session.active_prompt_req_id = 0;
+        try encode_claude_user_message(allocator, prompt, attachments, &var frame);
+    } else if session.kind == ProviderKind::Codex {
+        let req_id = session.alloc_req_id();
+        session.active_prompt_req_id = req_id;
+        let tid = session.session_id.as_bytes();
+        let model_bytes = session.model.as_bytes();
+        try encode_codex_turn_start(
+            allocator,
+            req_id,
+            tid,
+            prompt,
+            attachments,
+            model_bytes,
+            session.effort,
+            &var frame
+        );
+    } else {
+        return false;
+    }
+    if !write_line_string(&session.process, allocator, &frame) {
+        let fail_step = provider_session_advance(session.state, ProviderSessionEvent::FailTransport);
+        session.state = fail_step.state;
+        try push_failed_event(allocator, out_events, "プロバイダへの送信に失敗しました");
+        return false;
+    }
+    return true;
+}
+
+fn send_acp_effort_if_needed(
+    allocator: Allocator,
+    session: &var ProviderSession,
+    effort: ReasoningEffort
+) -> mem::Error!void {
+    if session.effort_option_id.len() == 0 or session.session_id.len() == 0 {
+        return;
+    }
+    let req_id = session.alloc_req_id();
+    var line = string::new(allocator);
+    defer line.deinit(allocator);
+    let sid = session.session_id.as_bytes();
+    let cid = session.effort_option_id.as_bytes();
+    try encode_acp_set_config(allocator, req_id, sid, cid, effort_id(effort), &var line);
+    let _ = write_line_string(&session.process, allocator, &line);
+    return;
+}
+
+fn (self: &ProviderSession) can_reuse_live(
+    kind: ProviderKind,
+    cwd: []u8,
+    model: []u8,
+    effort: ReasoningEffort,
+    suppress_telemetry: bool
+) -> bool {
+    if self.state != ProviderSessionState::Ready {
+        return false;
+    }
+    if self.kind != kind or self.suppress_telemetry != suppress_telemetry {
+        return false;
+    }
+    if kind == ProviderKind::ClaudeCode {
+        let cur_model = self.model.as_bytes();
+        if !mem::equal_bytes(cur_model, model) or self.effort != effort {
+            return false;
+        }
+    }
+    let cur_cwd = self.cwd.as_bytes();
+    if !mem::equal_bytes(cur_cwd, cwd) {
+        return false;
+    }
+    return self.process.is_live() and !self.process.is_ended();
+}
+
+pub fn (self: &var ProviderSession) steer_prompt(
+    allocator: Allocator,
+    prompt: []u8,
+    attachments: &array::Array<string::String>,
+    out_events: &var array::Array<SessionEvent>
+) -> mem::Error!bool {
+    if self.kind != ProviderKind::AntigravityAcp {
+        return false;
+    }
+    if self.state != ProviderSessionState::Prompting or self.session_id.len() == 0 {
+        return false;
+    }
+    if !self.process.is_live() or self.process.is_ended() {
+        return false;
+    }
+    let req_id = self.alloc_req_id();
+    self.active_prompt_req_id = req_id;
+    self.emitted_delta_in_turn = false;
+    self.fallback_assistant_text.clear();
+    var frame = string::new(allocator);
+    defer frame.deinit(allocator);
+    let sid = self.session_id.as_bytes();
+    try encode_acp_prompt(allocator, req_id, sid, prompt, attachments, &var frame);
+    if !write_line_string(&self.process, allocator, &frame) {
+        let fail_step = provider_session_advance(self.state, ProviderSessionEvent::FailTransport);
+        self.state = fail_step.state;
+        try push_failed_event(allocator, out_events, "プロバイダへの送信に失敗しました");
+        return false;
+    }
+    return true;
+}
+
+pub fn (self: &var ProviderSession) start_turn(
+    allocator: Allocator,
+    kind: ProviderKind,
+    cwd: []u8,
+    model: []u8,
+    effort: ReasoningEffort,
+    resume_session_id: []u8,
+    suppress_telemetry: bool,
+    bridge_socket: []u8,
+    bridge_bin: []u8,
+    overrides: &array::Array<CommandOverride>,
+    prompt: []u8,
+    attachments: &array::Array<string::String>,
+    out_events: &var array::Array<SessionEvent>
+) -> mem::Error!bool {
+    if self.can_reuse_live(kind, cwd, model, effort, suppress_telemetry) {
+        var prev_model = string::new(allocator);
+        defer prev_model.deinit(allocator);
+        try prev_model.append_string(allocator, &self.model);
+        let prev_effort = self.effort;
+        self.model.clear();
+        try self.model.append_bytes(allocator, model);
+        self.effort = effort;
+        if is_acp_provider(kind) {
+            let prev_bytes = prev_model.as_bytes();
+            try send_acp_config_if_needed(allocator, self, model, prev_bytes);
+            if prev_effort != effort {
+                try send_acp_effort_if_needed(allocator, self, effort);
+            }
+        }
+        return dispatch_prompt_now(allocator, self, prompt, attachments, out_events);
+    }
+
+    self.disconnect(allocator);
+    if self.kind != kind {
+        self.session_id.clear();
+        self.model_option_id.clear();
+        self.effort_option_id.clear();
+    }
+    self.kind = kind;
+    self.cwd.clear();
+    try self.cwd.append_bytes(allocator, cwd);
+    self.model.clear();
+    try self.model.append_bytes(allocator, model);
+    self.effort = effort;
+    self.suppress_telemetry = suppress_telemetry;
+    if mem::len(resume_session_id) > 0 and self.session_id.len() == 0 {
+        try self.session_id.append_bytes(allocator, resume_session_id);
+    }
+
+    let sid_for_launch = self.session_id.as_bytes();
+    var launch = try build_provider_launch(
+        allocator,
+        self.thread_id,
+        kind,
+        cwd,
+        model,
+        effort,
+        sid_for_launch,
+        suppress_telemetry,
+        bridge_socket,
+        bridge_bin,
+        overrides
+    );
+    defer launch.deinit(allocator);
+
+    if self.process.spawn_in_place(allocator, &launch) {} else |_| {
+        let fail_step = provider_session_advance(self.state, ProviderSessionEvent::FailTransport);
+        self.state = fail_step.state;
+        var msg = try string::from_bytes(allocator, "プロバイダ CLI を起動できませんでした: ");
+        defer msg.deinit(allocator);
+        let exec_bytes = launch.executable.as_bytes();
+        try msg.append_bytes(allocator, exec_bytes);
+        let msg_bytes = msg.as_bytes();
+        try push_failed_event(allocator, out_events, msg_bytes);
+        return false;
+    }
+
+    if kind == ProviderKind::ClaudeCode {
+        let step = provider_session_advance(self.state, ProviderSessionEvent::SpawnDirectPrompt);
+        self.state = step.state;
+        self.emitted_delta_in_turn = false;
+        self.fallback_assistant_text.clear();
+        var frame = string::new(allocator);
+        defer frame.deinit(allocator);
+        try encode_claude_user_message(allocator, prompt, attachments, &var frame);
+        if !write_line_string(&self.process, allocator, &frame) {
+            let fail_step = provider_session_advance(self.state, ProviderSessionEvent::FailTransport);
+            self.state = fail_step.state;
+            try push_failed_event(allocator, out_events, "Claude Code への入力送信に失敗しました");
+            return false;
+        }
+        return true;
+    }
+
+    let step = provider_session_advance(self.state, ProviderSessionEvent::SpawnHandshake);
+    self.state = step.state;
+    self.has_pending_prompt = true;
+    self.pending_prompt_text.clear();
+    try self.pending_prompt_text.append_bytes(allocator, prompt);
+    try replace_string_list(allocator, &var self.pending_prompt_attachments, attachments);
+
+    let init_id = self.alloc_req_id();
+    self.init_req_id = init_id;
+    self.model_list_req_id = 0;
+    self.session_new_req_id = 0;
+    self.active_prompt_req_id = 0;
+
+    var init_frame = string::new(allocator);
+    defer init_frame.deinit(allocator);
+    if is_acp_provider(kind) {
+        try encode_acp_initialize(allocator, init_id, &var init_frame);
+    } else {
+        try encode_codex_initialize(allocator, init_id, &var init_frame);
+    }
+    if !write_line_string(&self.process, allocator, &init_frame) {
+        let fail_step = provider_session_advance(self.state, ProviderSessionEvent::FailTransport);
+        self.state = fail_step.state;
+        self.has_pending_prompt = false;
+        try push_failed_event(allocator, out_events, "プロバイダの初期化送信に失敗しました");
+        return false;
+    }
+    return true;
+}
+
+fn dispatch_pending_prompt(
+    allocator: Allocator,
+    session: &var ProviderSession,
+    out_events: &var array::Array<SessionEvent>
+) -> mem::Error!bool {
+    if !session.has_pending_prompt {
+        return true;
+    }
+    session.has_pending_prompt = false;
+    var prompt_copy = string::new(allocator);
+    defer prompt_copy.deinit(allocator);
+    try prompt_copy.append_string(allocator, &session.pending_prompt_text);
+    session.pending_prompt_text.clear();
+    var att_copy = try clone_strings(allocator, &session.pending_prompt_attachments);
+    defer att_copy.deinit(allocator);
+    session.pending_prompt_attachments.clear(allocator);
+    let prompt_bytes = prompt_copy.as_bytes();
+    return dispatch_prompt_now(allocator, session, prompt_bytes, &att_copy, out_events);
+}
+
+fn handle_wire_signal(
+    allocator: Allocator,
+    session: &var ProviderSession,
+    signal: &WireSignal,
+    out_events: &var array::Array<SessionEvent>
+) -> mem::Error!bool {
+    if signal.kind == WireSignalKind::Ignore {
+        return false;
+    }
+    if signal.kind == WireSignalKind::InitializeResult {
+        let step = provider_session_advance(session.state, ProviderSessionEvent::InitializeOk);
+        if step.outcome != ProviderSessionOutcome::SessionCreationStarted {
+            return false;
+        }
+        session.state = step.state;
+        if is_acp_provider(session.kind) {
+            let req_id = session.alloc_req_id();
+            session.session_new_req_id = req_id;
+            var frame = string::new(allocator);
+            defer frame.deinit(allocator);
+            let cwd_bytes = session.cwd.as_bytes();
+            if session.session_id.len() > 0 {
+                session.attempting_resume = true;
+                let sid_bytes = session.session_id.as_bytes();
+                try encode_acp_session_load(allocator, req_id, sid_bytes, cwd_bytes, &var frame);
+            } else {
+                session.attempting_resume = false;
+                try encode_acp_session_new(allocator, req_id, cwd_bytes, &var frame);
+            }
+            if !write_line_string(&session.process, allocator, &frame) {
+                let fail_step = provider_session_advance(session.state, ProviderSessionEvent::FailTransport);
+                session.state = fail_step.state;
+                session.has_pending_prompt = false;
+                session.attempting_resume = false;
+                try push_failed_event(allocator, out_events, "ACP セッション作成の送信に失敗しました");
+            }
+        } else if session.kind == ProviderKind::Codex {
+            var initialized_frame = string::new(allocator);
+            defer initialized_frame.deinit(allocator);
+            try encode_codex_initialized(allocator, &var initialized_frame);
+            let _ = write_line_string(&session.process, allocator, &initialized_frame);
+
+            let ml_id = session.alloc_req_id();
+            session.model_list_req_id = ml_id;
+            var ml_frame = string::new(allocator);
+            defer ml_frame.deinit(allocator);
+            try encode_codex_model_list(allocator, ml_id, &var ml_frame);
+            let _ = write_line_string(&session.process, allocator, &ml_frame);
+
+            let ts_id = session.alloc_req_id();
+            session.session_new_req_id = ts_id;
+            var ts_frame = string::new(allocator);
+            defer ts_frame.deinit(allocator);
+            let cwd_bytes = session.cwd.as_bytes();
+            let model_bytes = session.model.as_bytes();
+            if session.session_id.len() > 0 {
+                session.attempting_resume = true;
+                let sid_bytes = session.session_id.as_bytes();
+                try encode_codex_thread_resume(
+                    allocator,
+                    ts_id,
+                    sid_bytes,
+                    cwd_bytes,
+                    model_bytes,
+                    &var ts_frame
+                );
+            } else {
+                session.attempting_resume = false;
+                try encode_codex_thread_start(allocator, ts_id, cwd_bytes, model_bytes, &var ts_frame);
+            }
+            if !write_line_string(&session.process, allocator, &ts_frame) {
+                let fail_step = provider_session_advance(session.state, ProviderSessionEvent::FailTransport);
+                session.state = fail_step.state;
+                session.has_pending_prompt = false;
+                session.attempting_resume = false;
+                try push_failed_event(allocator, out_events, "Codex スレッド開始の送信に失敗しました");
+            }
+        }
+        return true;
+    }
+    if signal.kind == WireSignalKind::SessionCreated {
+        session.attempting_resume = false;
+        if signal.session_id.len() > 0 {
+            session.session_id.clear();
+            try session.session_id.append_string(allocator, &signal.session_id);
+            var sid_ev = new_session_event(allocator, SessionEventKind::SessionIdUpdated);
+            errdefer sid_ev.deinit(allocator);
+            try sid_ev.session_id.append_string(allocator, &signal.session_id);
+            try out_events.append(allocator, move sid_ev);
+        }
+        if signal.model_option_id.len() > 0 {
+            session.model_option_id.clear();
+            try session.model_option_id.append_string(allocator, &signal.model_option_id);
+        }
+        if signal.effort_option_id.len() > 0 {
+            session.effort_option_id.clear();
+            try session.effort_option_id.append_string(allocator, &signal.effort_option_id);
+        }
+        if signal.models.len() > 0 or signal.current_model.len() > 0 {
+            var m_ev = new_session_event(allocator, SessionEventKind::ModelsUpdated);
+            errdefer m_ev.deinit(allocator);
+            try m_ev.current_model.append_string(allocator, &signal.current_model);
+            try replace_string_list(allocator, &var m_ev.models, &signal.models);
+            try out_events.append(allocator, move m_ev);
+        }
+        if session.state == ProviderSessionState::SessionCreating {
+            let step = provider_session_advance(session.state, ProviderSessionEvent::SessionReady);
+            session.state = step.state;
+            if is_acp_provider(session.kind) {
+                var target_model = string::new(allocator);
+                defer target_model.deinit(allocator);
+                try target_model.append_string(allocator, &session.model);
+                let target_bytes = target_model.as_bytes();
+                let current_bytes = signal.current_model.as_bytes();
+                try send_acp_config_if_needed(allocator, session, target_bytes, current_bytes);
+            }
+            let _ = try dispatch_pending_prompt(allocator, session, out_events);
+        }
+        return true;
+    }
+    if signal.kind == WireSignalKind::ModelCatalog {
+        if signal.models.len() > 0 {
+            var m_ev = new_session_event(allocator, SessionEventKind::ModelsUpdated);
+            errdefer m_ev.deinit(allocator);
+            try replace_string_list(allocator, &var m_ev.models, &signal.models);
+            try out_events.append(allocator, move m_ev);
+        }
+        return true;
+    }
+    if signal.kind == WireSignalKind::Delta {
+        let step = provider_session_advance(session.state, ProviderSessionEvent::ReceiveDelta);
+        if step.outcome != ProviderSessionOutcome::DeltaAccepted {
+            return false;
+        }
+        session.state = step.state;
+        session.emitted_delta_in_turn = true;
+        var ev = new_session_event(allocator, SessionEventKind::Delta);
+        errdefer ev.deinit(allocator);
+        try ev.text.append_string(allocator, &signal.text);
+        try out_events.append(allocator, move ev);
+        return true;
+    }
+    if signal.kind == WireSignalKind::AssistantFallback {
+        session.fallback_assistant_text.clear();
+        try session.fallback_assistant_text.append_string(allocator, &signal.text);
+        return false;
+    }
+    if signal.kind == WireSignalKind::Activity {
+        if session.state != ProviderSessionState::Prompting and
+            session.state != ProviderSessionState::AwaitingPermission {
+            return false;
+        }
+        var ev = new_session_event(allocator, SessionEventKind::Activity);
+        errdefer ev.deinit(allocator);
+        try ev.call_id.append_string(allocator, &signal.call_id);
+        try ev.activity_kind.append_string(allocator, &signal.activity_kind);
+        try ev.activity_status.append_string(allocator, &signal.activity_status);
+        try ev.text.append_string(allocator, &signal.text);
+        try ev.detail.append_string(allocator, &signal.detail);
+        try out_events.append(allocator, move ev);
+        return true;
+    }
+    if signal.kind == WireSignalKind::UnknownRequest {
+        var err_frame = string::new(allocator);
+        defer err_frame.deinit(allocator);
+        let str_id = signal.str_req_id.as_bytes();
+        let method_bytes = signal.text.as_bytes();
+        try encode_rpc_method_not_found(
+            allocator,
+            signal.req_id,
+            str_id,
+            method_bytes,
+            &var err_frame
+        );
+        let _ = write_line_string(&session.process, allocator, &err_frame);
+        return false;
+    }
+    if signal.kind == WireSignalKind::PermissionRequest {
+        let step = provider_session_advance(session.state, ProviderSessionEvent::RequestPermission);
+        if step.outcome != ProviderSessionOutcome::PermissionPending {
+            return false;
+        }
+        session.state = step.state;
+        session.pending_permission_num_id = signal.req_id;
+        session.pending_permission_str_id.clear();
+        try session.pending_permission_str_id.append_string(allocator, &signal.str_req_id);
+        session.allow_option_id.clear();
+        try session.allow_option_id.append_string(allocator, &signal.allow_option_id);
+        session.reject_option_id.clear();
+        try session.reject_option_id.append_string(allocator, &signal.reject_option_id);
+
+        var ev = new_session_event(allocator, SessionEventKind::PermissionRequested);
+        errdefer ev.deinit(allocator);
+        try ev.text.append_string(allocator, &signal.text);
+        try ev.detail.append_string(allocator, &signal.detail);
+        try out_events.append(allocator, move ev);
+        return true;
+    }
+    if signal.kind == WireSignalKind::TurnDone {
+        let step = provider_session_advance(session.state, ProviderSessionEvent::CompleteTurn);
+        if step.outcome != ProviderSessionOutcome::TurnFinished {
+            return false;
+        }
+        session.state = step.state;
+        session.active_prompt_req_id = 0;
+        var ev = new_session_event(allocator, SessionEventKind::TurnCompleted);
+        errdefer ev.deinit(allocator);
+        if !session.emitted_delta_in_turn {
+            if signal.text.len() > 0 {
+                try ev.text.append_string(allocator, &signal.text);
+            } else if session.fallback_assistant_text.len() > 0 {
+                try ev.text.append_string(allocator, &session.fallback_assistant_text);
+            }
+        }
+        session.emitted_delta_in_turn = false;
+        session.fallback_assistant_text.clear();
+        try out_events.append(allocator, move ev);
+        return true;
+    }
+    if signal.kind == WireSignalKind::TurnError {
+        if session.state == ProviderSessionState::SessionCreating and
+            session.attempting_resume and
+            signal.req_id == session.session_new_req_id {
+            session.attempting_resume = false;
+            session.session_id.clear();
+            let req_id = session.alloc_req_id();
+            session.session_new_req_id = req_id;
+            var frame = string::new(allocator);
+            defer frame.deinit(allocator);
+            let cwd_bytes = session.cwd.as_bytes();
+            if is_acp_provider(session.kind) {
+                try encode_acp_session_new(allocator, req_id, cwd_bytes, &var frame);
+            } else if session.kind == ProviderKind::Codex {
+                let model_bytes = session.model.as_bytes();
+                try encode_codex_thread_start(allocator, req_id, cwd_bytes, model_bytes, &var frame);
+            }
+            if !write_line_string(&session.process, allocator, &frame) {
+                let fail_step = provider_session_advance(session.state, ProviderSessionEvent::FailTransport);
+                session.state = fail_step.state;
+                session.has_pending_prompt = false;
+                try push_failed_event(allocator, out_events, "セッション再作成の送信に失敗しました");
+            }
+            return true;
+        }
+        let step = provider_session_advance(session.state, ProviderSessionEvent::FailTransport);
+        session.state = step.state;
+        session.has_pending_prompt = false;
+        session.attempting_resume = false;
+        session.active_prompt_req_id = 0;
+        var ev = new_session_event(allocator, SessionEventKind::TurnFailed);
+        errdefer ev.deinit(allocator);
+        if signal.detail.len() > 0 {
+            try ev.detail.append_string(allocator, &signal.detail);
+        } else {
+            try ev.detail.append_bytes(allocator, "プロバイダがエラーを返しました");
+        }
+        try out_events.append(allocator, move ev);
+        return true;
+    }
+    return false;
+}
+
+fn parse_session_line(
+    allocator: Allocator,
+    session: &ProviderSession,
+    line: []u8
+) -> mem::Error!WireSignal {
+    if is_acp_provider(session.kind) {
+        return parse_acp_line(
+            allocator,
+            line,
+            session.init_req_id,
+            session.session_new_req_id,
+            session.active_prompt_req_id
+        );
+    }
+    if session.kind == ProviderKind::ClaudeCode {
+        return parse_claude_line(allocator, line);
+    }
+    if session.kind == ProviderKind::Codex {
+        return parse_codex_line(
+            allocator,
+            line,
+            session.init_req_id,
+            session.model_list_req_id,
+            session.session_new_req_id,
+            session.active_prompt_req_id
+        );
+    }
+    return new_wire_signal(allocator);
+}
+
+pub fn (self: &var ProviderSession) poll(
+    allocator: Allocator,
+    out_events: &var array::Array<SessionEvent>
+) -> mem::Error!bool {
+    if self.state == ProviderSessionState::Disconnected or self.state == ProviderSessionState::Failed {
+        return false;
+    }
+    var changed = false;
+    let _ = try self.process.read_available(allocator);
+    var line = string::new(allocator);
+    defer line.deinit(allocator);
+    while try self.process.take_line(allocator, &var line) {
+        let bytes = line.as_bytes();
+        if mem::len(bytes) > 0 {
+            let signal = try parse_session_line(allocator, self, bytes);
+            defer signal.deinit(allocator);
+            if try handle_wire_signal(allocator, self, &signal, out_events) {
+                changed = true;
+            }
+        }
+    }
+
+    let exited = self.process.poll_exited();
+    if exited or self.process.is_ended() {
+        if self.state == ProviderSessionState::Initializing or
+            self.state == ProviderSessionState::SessionCreating or
+            self.state == ProviderSessionState::Prompting or
+            self.state == ProviderSessionState::AwaitingPermission {
+            let step = provider_session_advance(self.state, ProviderSessionEvent::FailTransport);
+            self.state = step.state;
+            self.has_pending_prompt = false;
+            self.active_prompt_req_id = 0;
+            var msg = try string::from_bytes(allocator, "プロバイダプロセスが終了しました (code=");
+            defer msg.deinit(allocator);
+            try fmt::append_i64(allocator, &var msg, self.process.exit_code());
+            try msg.append_bytes(allocator, ")");
+            let msg_bytes = msg.as_bytes();
+            try push_failed_event(allocator, out_events, msg_bytes);
+            changed = true;
+        } else if self.state == ProviderSessionState::Ready {
+            self.disconnect(allocator);
+        }
+    }
+    return changed;
+}
+
+pub fn (self: &var ProviderSession) resolve_permission(
+    allocator: Allocator,
+    approve: bool
+) -> mem::Error!bool {
+    if self.state != ProviderSessionState::AwaitingPermission {
+        return false;
+    }
+    var frame = string::new(allocator);
+    defer frame.deinit(allocator);
+    if is_acp_provider(self.kind) {
+        if self.pending_permission_str_id.len() > 0 {
+            let str_id = self.pending_permission_str_id.as_bytes();
+            if approve {
+                let opt_bytes = self.allow_option_id.as_bytes();
+                try encode_acp_permission_reply_str_id(allocator, str_id, opt_bytes, &var frame);
+            } else {
+                let opt_bytes = self.reject_option_id.as_bytes();
+                try encode_acp_permission_reply_str_id(allocator, str_id, opt_bytes, &var frame);
+            }
+        } else if approve {
+            let opt_bytes = self.allow_option_id.as_bytes();
+            try encode_acp_permission_reply(allocator, self.pending_permission_num_id, opt_bytes, &var frame);
+        } else {
+            let opt_bytes = self.reject_option_id.as_bytes();
+            try encode_acp_permission_reply(allocator, self.pending_permission_num_id, opt_bytes, &var frame);
+        }
+        let _ = write_line_string(&self.process, allocator, &frame);
+        if !approve and self.session_id.len() > 0 {
+            var cancel_frame = string::new(allocator);
+            defer cancel_frame.deinit(allocator);
+            let sid = self.session_id.as_bytes();
+            try encode_acp_cancel(allocator, sid, &var cancel_frame);
+            let _ = write_line_string(&self.process, allocator, &cancel_frame);
+        }
+    } else if self.kind == ProviderKind::ClaudeCode {
+        let req_id_bytes = self.pending_permission_str_id.as_bytes();
+        try encode_claude_control_response(allocator, req_id_bytes, approve, &var frame);
+        let _ = write_line_string(&self.process, allocator, &frame);
+    } else if self.kind == ProviderKind::Codex {
+        try encode_codex_approval_reply(allocator, self.pending_permission_num_id, approve, &var frame);
+        let _ = write_line_string(&self.process, allocator, &frame);
+        if !approve and self.session_id.len() > 0 {
+            let int_id = self.alloc_req_id();
+            var int_frame = string::new(allocator);
+            defer int_frame.deinit(allocator);
+            let tid = self.session_id.as_bytes();
+            try encode_codex_turn_interrupt(allocator, int_id, tid, &var int_frame);
+            let _ = write_line_string(&self.process, allocator, &int_frame);
+        }
+    }
+
+    var ev = ProviderSessionEvent::ResolvePermissionDeny;
+    if approve {
+        ev = ProviderSessionEvent::ResolvePermissionAllow;
+    }
+    let step = provider_session_advance(self.state, ev);
+    self.state = step.state;
+    self.pending_permission_num_id = 0;
+    self.pending_permission_str_id.clear();
+    self.allow_option_id.clear();
+    self.reject_option_id.clear();
+    if !approve {
+        self.active_prompt_req_id = 0;
+    }
+    return true;
+}
+
+pub fn (self: &var ProviderSession) cancel_turn(allocator: Allocator) -> mem::Error!bool {
+    if self.state == ProviderSessionState::Initializing or
+        self.state == ProviderSessionState::SessionCreating {
+        self.disconnect(allocator);
+        return true;
+    }
+    if self.state != ProviderSessionState::Prompting and
+        self.state != ProviderSessionState::AwaitingPermission {
+        return false;
+    }
+    if is_acp_provider(self.kind) and self.session_id.len() > 0 {
+        var cancel_frame = string::new(allocator);
+        defer cancel_frame.deinit(allocator);
+        let sid = self.session_id.as_bytes();
+        try encode_acp_cancel(allocator, sid, &var cancel_frame);
+        let _ = write_line_string(&self.process, allocator, &cancel_frame);
+        let step = provider_session_advance(self.state, ProviderSessionEvent::CancelTurn);
+        self.state = step.state;
+        self.active_prompt_req_id = 0;
+        return true;
+    }
+    if self.kind == ProviderKind::Codex and self.session_id.len() > 0 {
+        let int_id = self.alloc_req_id();
+        var int_frame = string::new(allocator);
+        defer int_frame.deinit(allocator);
+        let tid = self.session_id.as_bytes();
+        try encode_codex_turn_interrupt(allocator, int_id, tid, &var int_frame);
+        let _ = write_line_string(&self.process, allocator, &int_frame);
+        let step = provider_session_advance(self.state, ProviderSessionEvent::CancelTurn);
+        self.state = step.state;
+        self.active_prompt_req_id = 0;
+        return true;
+    }
+    self.process.send_interrupt();
+    self.disconnect(allocator);
+    return true;
+}
